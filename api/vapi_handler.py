@@ -5,16 +5,23 @@ Vapi → Property search proxy (Vercel-compatible, class-based)
 
 • Exposed at   /api/vapi_handler
 • Accepts POST tool-call envelopes from Vapi (see sample body below)
-• Optionally fires WhatsApp (unless `"dry": true`)
-• Responds with    {"results":[{"toolCallId":"…","result":…}]}
+• Optionally fires WhatsApp (unless "dry": true)
+• Responds with    {"results": [{"toolCallId": "…", "result": …}]}
 
 This module **exports a class called `handler` that subclasses
 BaseHTTPRequestHandler** – exactly what the Vercel Python runtime
 is looking for, avoiding the previous `issubclass` TypeError.
+
+NEW 2025-05-26
+──────────────
+• Added graceful handling of the nested OpenAI/Vapi tool-call format
+  ("type": "function", "function": {"name": …, "arguments": …}).
+  The code still supports the older, flatter shape to keep unit tests
+  and CLI fixtures working.
 """
 
 from __future__ import annotations
-from property_search import (      # type: ignore  # pylint: disable=import-error
+from property_search import (  # type: ignore  # pylint: disable=import-error
     Settings,
     PropertyRepository,
     summarise,
@@ -31,7 +38,7 @@ from typing import Any, Dict, List
 from dotenv import load_dotenv
 
 # helper functions live in lib/
-sys.path.append("lib")              # allow import without packaging
+sys.path.append("lib")  # allow import without packaging
 
 # ────────────────────────────────────────────────────────────────
 CORS = {
@@ -86,9 +93,11 @@ class handler(BaseHTTPRequestHandler):  # pylint: disable=invalid-name
     # -------- envelope → results ------------------------------------------
     def _process_envelope(self, env: Dict[str, Any]) -> tuple[int, list[tuple[str, str]], bytes]:
         message = env.get("message") or {}
-        calls: list = message.get("toolCallList") or []
+        # Accept both alias keys just in case Vapi changes again
+        calls: list = message.get(
+            "toolCallList") or message.get("toolCalls") or []
         if not calls:
-            return _json_response(400, {"error": "no toolCallList in body"})
+            return _json_response(400, {"error": "no tool calls in body"})
 
         # One repo / cfg per lambda invocation
         try:
@@ -103,8 +112,20 @@ class handler(BaseHTTPRequestHandler):  # pylint: disable=invalid-name
         results = []
         for call in calls:
             tc_id = call.get("id", "unknown")
-            name = call.get("name")
-            args = call.get("arguments") or {}
+
+            # → NEW: normalise OpenAI/Vapi "function" wrapper ←
+            if call.get("type") == "function":
+                fn = call.get("function") or {}
+            else:
+                fn = {}
+
+            name = fn.get("name") or call.get("name")
+            args = fn.get("arguments") or call.get("arguments") or {}
+
+            if not name:
+                results.append(
+                    {"toolCallId": tc_id, "result": "tool name missing"})
+                continue
 
             if name != "find_property":
                 results.append(
@@ -118,9 +139,9 @@ class handler(BaseHTTPRequestHandler):  # pylint: disable=invalid-name
                     {"toolCallId": tc_id, "result": "location is required"})
                 continue
 
-            query = {"keyword": loc, "status": args.get("status", "current")}
-            for fld in ("beds_min", "baths_min", "price_min", "price_max", "purpose"):
-                if fld in args:
+            query = {"keyword": loc, "purpose": args.get("purpose", "all")}
+            for fld in ("beds_min", "baths_min", "price_min", "price_max"):
+                if fld in args and args[fld] is not None:
                     query[fld] = args[fld]
 
             # ----- search --------------------------------------------------
