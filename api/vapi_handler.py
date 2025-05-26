@@ -1,147 +1,136 @@
 #!/usr/bin/env python3
 # File: api/vapi_handler.py
 """
-Vapi.ai → Jefferies bridge (import-driven, no subprocess)
-──────────────────────────────────────────────────────────
-POST body example
+VAPI → Property search proxy for Vercel
+───────────────────────────────────────
+• POST /api/vapi_handler  – JSON body (see schema below)
+• OPTIONS                 – CORS pre-flight
+
+Body schema (simplified):
 
 {
-  "name":         "Alice",
-  "location":     "Hyde Park",
-  "purpose":      "sale",             # sale | rental | all (optional, default all)
-  "beds_min":     2,                  # optional
-  "baths_min":    2,                  # optional
-  "price_min":    500000,             # optional
-  "price_max":    750000,             # optional
-  "phone_number": "27761234567"       # required for WhatsApp send
+  "name": "Alice",                 # optional – voice greeting only
+  "location": "London",            # required – text search / keyword
+  "status": "current|sold",        # optional – default "current"
+  "beds_min": 2,                   # optional
+  "baths_min": 1,                  # optional
+  "price_min": 500000,             # optional
+  "price_max": 1000000,            # optional
+  "phone_number": "2776…",         # optional – send brochure via WhatsApp
+  "dry": true                      # optional – skip WhatsApp when true
 }
 
-Success response
-
-{
-  "message": "Alice – I’ve found a matching property in Bayswater. The brochure is on WhatsApp.",
-  "property": { ...summary... }
-}
+Success → 200 JSON summary (same as property_search CLI).  
+Errors  → 4xx / 5xx JSON `{"error": "…"}`
 """
 
 from __future__ import annotations
-import importlib.util as _ilu
 
 import json
 import os
-import sys
-from http.server import BaseHTTPRequestHandler
-from pathlib import Path
-from typing import Any, Dict
+import traceback
+from typing import Any, Dict, Tuple
 
-# ───── import property_search.py by absolute path ───────────────────────
-ROOT = Path(__file__).resolve().parent.parent
-SEARCH_PATH = ROOT / "lib" / "property_search.py"
+from dotenv import load_dotenv
 
+# the property_search helper functions live one directory up
+from lib.property_search import (  # pylint: disable=import-error
+    Settings,
+    PropertyRepository,
+    summarise,
+    send_whatsapp,
+)
 
-spec = _ilu.spec_from_file_location("property_search", SEARCH_PATH)
-if spec is None or spec.loader is None:
-    raise ImportError(f"Cannot load {SEARCH_PATH}")
-_property_search = _ilu.module_from_spec(spec)
-
-# --- ADD THIS LINE so dataclasses can find the module -------------------
-sys.modules[spec.name] = _property_search
-# ------------------------------------------------------------------------
-
-spec.loader.exec_module(_property_search)  # type: ignore[attr-defined]
-
-Settings = _property_search.Settings
-PropertyRepository = _property_search.PropertyRepository
-summarise = _property_search.summarise
-send_whatsapp = _property_search.send_whatsapp
-
-# ───── singletons reused across invocations ─────────────────────────────
-CFG = Settings.from_env()
-REPO = PropertyRepository(CFG)
-
-# ───── helpers ──────────────────────────────────────────────────────────
+# ──────────────── CORS helpers ──────────────────────────────────
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+}
 
 
-def _find_matching(payload: Dict[str, Any]) -> Dict[str, Any] | None:
-    qry: Dict[str, Any] = {
-        "keyword": payload["location"],
-        "purpose": payload.get("purpose", "all"),
+def _response(
+    status: int,
+    payload: Dict[str, Any] | str,
+    extra_headers: Dict[str, str] | None = None,
+) -> Tuple[int, Dict[str, str], str]:
+    """Return Vercel-style response tuple."""
+    headers = {
+        "Content-Type": "application/json",
+        **CORS_HEADERS,
+        **(extra_headers or {}),
     }
-    for fld in ("beds_min", "baths_min", "price_min", "price_max"):
-        if fld in payload and payload[fld] not in (None, "", 0):
-            qry[fld] = payload[fld]
-
-    doc, _tier = REPO.find_one(qry)
-    return summarise(doc) if doc else None
+    body = payload if isinstance(payload, str) else json.dumps(
+        payload, ensure_ascii=False)
+    return status, headers, body
 
 
-def _success_msg(name: str | None, locality: str, sent: bool) -> str:
-    if sent:
-        return f"{name or 'Hi'} – I’ve found a matching property in {locality}. The brochure is on WhatsApp."
-    return f"{name or 'Here are the details'} of a matching property in {locality}."
+def _bad(status: int, msg: str) -> Tuple[int, Dict[str, str], str]:
+    return _response(status, {"error": msg})
 
 
-# ───── HTTP entry-point (works on Vercel/Lambda) ────────────────────────
-class handler(BaseHTTPRequestHandler):  # noqa: N801
-    def do_POST(self):  # noqa: N802
+# ──────────────── Vercel entrypoint ─────────────────────────────
+def handler(request):  # Vercel python runtime passes a werkzeug Request-like obj
+    # ---- CORS pre-flight --------------------------------------------------
+    if request.method == "OPTIONS":
+        return _response(204, "")
+
+    if request.method != "POST":
+        return _bad(405, "only POST supported")
+
+    # ---- parse JSON body --------------------------------------------------
+    try:
+        body = request.get_json(force=True, silent=False)
+    except Exception:
+        return _bad(400, "Invalid JSON")
+
+    if not isinstance(body, dict):
+        return _bad(400, "Body must be an object")
+
+    keyword = (body.get("location") or "").strip()
+    if not keyword:
+        return _bad(400, "location is required")
+
+    # ---- build search query ----------------------------------------------
+    query = {
+        "keyword": keyword,
+        "status": body.get("status", "current"),
+    }
+    for field in ("beds_min", "baths_min", "price_min", "price_max", "purpose"):
+        if field in body:
+            query[field] = body[field]
+
+    # ---- init repository --------------------------------------------------
+    load_dotenv()
+    try:
+        cfg = Settings.from_env()
+        repo = PropertyRepository(cfg)
+        if not repo.ping():
+            return _bad(503, "database unavailable")
+    except Exception as exc:  # pylint: disable=broad-except
+        return _bad(500, f"config error: {exc}")
+
+    # ---- search -----------------------------------------------------------
+    try:
+        doc, _tier = repo.find_one(query)
+    except ValueError as exc:
+        return _bad(400, str(exc))
+    except Exception as exc:  # pylint: disable=broad-except
+        traceback.print_exc()
+        return _bad(500, f"search failed: {exc}")
+
+    if not doc:
+        return _bad(404, "no matching property")
+
+    summary = summarise(doc)
+
+    # ---- optional WhatsApp ------------------------------------------------
+    phone = (body.get("phone_number") or "").strip()
+    if phone and not body.get("dry"):
         try:
-            body = self.rfile.read(
-                int(self.headers.get("Content-Length", "0"))).decode()
-            payload = json.loads(body or "{}")
-
-            # validation
-            if "location" not in payload:
-                raise ValueError("location is required")
-            if "phone_number" not in payload:
-                raise ValueError("phone_number is required")
-
-            summary = _find_matching(payload)
-            if not summary:
-                self._send(
-                    200, {"message": "Sorry, no matching property found."})
-                return
-
-            phone = payload["phone_number"]
-            try:
-                send_whatsapp(CFG, phone, summary)
-            except Exception as exc:  # pylint: disable=broad-except
-                self._send(
-                    200,
-                    {
-                        "message": "Property found but WhatsApp failed.",
-                        "error": str(exc),
-                        "property": summary,
-                    },
-                )
-                return
-
-            locality = summary["location"].get(
-                "locality") or summary["address"]
-            reply = {
-                "message": _success_msg(payload.get("name"), locality, True),
-                "property": summary,
-            }
-            self._send(200, reply)
-
+            send_whatsapp(cfg, phone, summary)
+            summary["whatsapp"] = "sent"
         except Exception as exc:  # pylint: disable=broad-except
-            if os.getenv("DEBUG"):
-                import traceback
-                traceback.print_exc()
-            self._send(500, {"error": str(exc)})
+            summary["whatsapp"] = f"error: {exc}"
 
-    # ------------------------------------------------------------
-    def _send(self, status: int, obj: Dict[str, Any]):
-        blob = json.dumps(obj, ensure_ascii=False).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(blob)
-
-
-# ───── Local dev runner (optional) ──────────────────────────────────────
-if __name__ == "__main__":
-    import socketserver
-    PORT = int(os.getenv("PORT", "8888"))
-    with socketserver.TCPServer(("", PORT), handler) as httpd:
-        print(f"Serving test endpoint on :{PORT}  (Ctrl-C to quit)")
-        httpd.serve_forever()
+    return _response(200, summary)
