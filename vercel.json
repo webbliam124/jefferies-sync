@@ -1,9 +1,5 @@
 {
   "version": 2,
-  "functions": {
-    "api/rex_sync.py": {},
-    "api/vapi_handler.py": {}
-  },
   "crons": [
     {
       "path": "/api/rex_sync",
