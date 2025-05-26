@@ -1,39 +1,37 @@
 #!/usr/bin/env python3
-# File: api/vapi_handler.py
 """
-VAPI → Property search proxy for Vercel
-───────────────────────────────────────
-• POST /api/vapi_handler  – JSON body (see schema below)
-• OPTIONS                 – CORS pre-flight
+Vapi Custom-Tool handler
+───────────────────────
+• Accepts Vapi “tool-calls” POST payloads
+• Runs a property search (lib/property_search.py) using the passed arguments
+• Optionally fires WhatsApp (unless "dry": true)
+• Returns the required   {"results":[{"toolCallId":"…","result":…}]}   structure
+• Adds basic CORS so you can hit it from Vapi’s web tester
 
-Body schema (simplified):
-
-{
-  "name": "Alice",                 # optional – voice greeting only
-  "location": "London",            # required – text search / keyword
-  "status": "current|sold",        # optional – default "current"
-  "beds_min": 2,                   # optional
-  "baths_min": 1,                  # optional
-  "price_min": 500000,             # optional
-  "price_max": 1000000,            # optional
-  "phone_number": "2776…",         # optional – send brochure via WhatsApp
-  "dry": true                      # optional – skip WhatsApp when true
+Expected tool name      :  find_property
+Expected argument object:  {
+    "name": "Alice",
+    "location": "London",
+    "beds_min": 2,
+    "baths_min": 1,
+    "price_min": 500000,
+    "price_max": 1000000,
+    "phone_number": "2776…",
+    "status": "current",
+    "purpose": "sale|rental",
+    "dry": true
 }
-
-Success → 200 JSON summary (same as property_search CLI).  
-Errors  → 4xx / 5xx JSON `{"error": "…"}`
 """
 
 from __future__ import annotations
 
 import json
-import os
 import traceback
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, List
 
 from dotenv import load_dotenv
 
-# the property_search helper functions live one directory up
+# helper module lives in lib/
 from lib.property_search import (  # pylint: disable=import-error
     Settings,
     PropertyRepository,
@@ -41,8 +39,8 @@ from lib.property_search import (  # pylint: disable=import-error
     send_whatsapp,
 )
 
-# ──────────────── CORS helpers ──────────────────────────────────
-CORS_HEADERS = {
+# ──────────────── simple CORS helpers ───────────────────────────
+CORS = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type",
@@ -50,87 +48,96 @@ CORS_HEADERS = {
 
 
 def _response(
-    status: int,
-    payload: Dict[str, Any] | str,
-    extra_headers: Dict[str, str] | None = None,
+    code: int, payload: Dict[str, Any] | str | List[Any] = ""
 ) -> Tuple[int, Dict[str, str], str]:
-    """Return Vercel-style response tuple."""
-    headers = {
-        "Content-Type": "application/json",
-        **CORS_HEADERS,
-        **(extra_headers or {}),
-    }
+    hdrs = {"Content-Type": "application/json", **CORS}
     body = payload if isinstance(payload, str) else json.dumps(
         payload, ensure_ascii=False)
-    return status, headers, body
-
-
-def _bad(status: int, msg: str) -> Tuple[int, Dict[str, str], str]:
-    return _response(status, {"error": msg})
+    return code, hdrs, body
 
 
 # ──────────────── Vercel entrypoint ─────────────────────────────
-def handler(request):  # Vercel python runtime passes a werkzeug Request-like obj
-    # ---- CORS pre-flight --------------------------------------------------
-    if request.method == "OPTIONS":
-        return _response(204, "")
+def handler(req):  # Vercel passes a werkzeug-like Request object
+    # -- Pre-flight ---------------------------------------------------------
+    if req.method == "OPTIONS":
+        return _response(204)
 
-    if request.method != "POST":
-        return _bad(405, "only POST supported")
+    if req.method != "POST":
+        return _response(405, {"error": "only POST supported"})
 
-    # ---- parse JSON body --------------------------------------------------
+    # -- Parse JSON ---------------------------------------------------------
     try:
-        body = request.get_json(force=True, silent=False)
+        data = req.get_json(force=True)
     except Exception:
-        return _bad(400, "Invalid JSON")
+        return _response(400, {"error": "invalid JSON"})
 
-    if not isinstance(body, dict):
-        return _bad(400, "Body must be an object")
+    if not isinstance(data, dict):
+        return _response(400, {"error": "body must be an object"})
 
-    keyword = (body.get("location") or "").strip()
-    if not keyword:
-        return _bad(400, "location is required")
+    message = data.get("message") or {}
+    calls: list = message.get("toolCallList") or []
+    if not calls:
+        return _response(400, {"error": "no toolCallList in body"})
 
-    # ---- build search query ----------------------------------------------
-    query = {
-        "keyword": keyword,
-        "status": body.get("status", "current"),
-    }
-    for field in ("beds_min", "baths_min", "price_min", "price_max", "purpose"):
-        if field in body:
-            query[field] = body[field]
+    results = []
 
-    # ---- init repository --------------------------------------------------
+    # -- Load env + repo once ----------------------------------------------
     load_dotenv()
     try:
         cfg = Settings.from_env()
         repo = PropertyRepository(cfg)
         if not repo.ping():
-            return _bad(503, "database unavailable")
+            return _response(503, {"error": "database unavailable"})
     except Exception as exc:  # pylint: disable=broad-except
-        return _bad(500, f"config error: {exc}")
+        return _response(500, {"error": f"config error: {exc}"})
 
-    # ---- search -----------------------------------------------------------
-    try:
-        doc, _tier = repo.find_one(query)
-    except ValueError as exc:
-        return _bad(400, str(exc))
-    except Exception as exc:  # pylint: disable=broad-except
-        traceback.print_exc()
-        return _bad(500, f"search failed: {exc}")
+    # -- Process each call --------------------------------------------------
+    for call in calls:
+        tc_id = call.get("id") or "unknown"
+        name = call.get("name")
+        args = call.get("arguments") or {}
 
-    if not doc:
-        return _bad(404, "no matching property")
+        if name != "find_property":
+            results.append(
+                {"toolCallId": tc_id, "result": f"unsupported tool {name}"})
+            continue
 
-    summary = summarise(doc)
-
-    # ---- optional WhatsApp ------------------------------------------------
-    phone = (body.get("phone_number") or "").strip()
-    if phone and not body.get("dry"):
+        # --- Build search query -------------------------------------------
         try:
-            send_whatsapp(cfg, phone, summary)
-            summary["whatsapp"] = "sent"
-        except Exception as exc:  # pylint: disable=broad-except
-            summary["whatsapp"] = f"error: {exc}"
+            kw = args["location"].strip()
+        except (KeyError, AttributeError):
+            results.append(
+                {"toolCallId": tc_id, "result": "location is required"})
+            continue
 
-    return _response(200, summary)
+        query = {"keyword": kw, "status": args.get("status", "current")}
+        for fld in ("beds_min", "baths_min", "price_min", "price_max", "purpose"):
+            if fld in args:
+                query[fld] = args[fld]
+
+        # --- Search --------------------------------------------------------
+        try:
+            doc, _tier = repo.find_one(query)
+            if not doc:
+                results.append(
+                    {"toolCallId": tc_id, "result": "no property found"})
+                continue
+            summary = summarise(doc)
+        except Exception as exc:  # pylint: disable=broad-except
+            traceback.print_exc()
+            results.append(
+                {"toolCallId": tc_id, "result": f"search error: {exc}"})
+            continue
+
+        # --- Optional WhatsApp --------------------------------------------
+        phone = (args.get("phone_number") or "").strip()
+        if phone and not args.get("dry"):
+            try:
+                send_whatsapp(cfg, phone, summary)
+                summary["whatsapp"] = "sent"
+            except Exception as exc:  # pylint: disable=broad-except
+                summary["whatsapp"] = f"error: {exc}"
+
+        results.append({"toolCallId": tc_id, "result": summary})
+
+    return _response(200, {"results": results})
