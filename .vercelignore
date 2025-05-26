@@ -1,4 +1,4 @@
-# Ignore compiled byte-code and envs
+# Ignore compiled artefacts & envs
 __pycache__/
 *.pyc
 .venv/
