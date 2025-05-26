@@ -1,0 +1,20 @@
+{
+  "functions": {
+    "api/rex_sync.py": {
+      "runtime": "python3.11",
+      "memory": 512,
+      "maxDuration": 60
+    },
+    "api/vapi_handler.py": {
+      "runtime": "python3.11",
+      "memory": 512,
+      "maxDuration": 15
+    }
+  },
+  "crons": [
+    {
+      "path": "/api/rex_sync",
+      "schedule": "0 3 * * *"
+    }
+  ]
+}

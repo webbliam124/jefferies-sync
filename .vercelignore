@@ -1,0 +1,4 @@
+# Ignore compiled byte-code and envs
+__pycache__/
+*.pyc
+.venv/
