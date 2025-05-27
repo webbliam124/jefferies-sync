@@ -6,6 +6,9 @@ property_search.py — Mongo search + WhatsApp notify
 Searches MongoDB for a matching property and sends a WhatsApp template
 (send_property).  The CLI also prints a compact JSON summary.
 
+NEW 2025-05-27
+──────────────
+• Added fuzzy `subcategory` filter (e.g. "Penthouse", "terraced house").
 NEW 2025-05-26
 ──────────────
 • Added --purpose {sale|rental|all}  (defaults to all)
@@ -14,6 +17,7 @@ NEW 2025-05-26
 
 from __future__ import annotations
 
+# stdlib
 import argparse
 import json
 import logging
@@ -21,8 +25,10 @@ import os
 import re
 import sys
 from dataclasses import dataclass
+from difflib import get_close_matches
 from typing import Any, Dict, List, Optional, Tuple
 
+# third-party
 import requests
 from dotenv import load_dotenv
 from pymongo import ASCENDING, MongoClient, TEXT
@@ -30,6 +36,46 @@ from pymongo.collection import Collection
 from pymongo.errors import ConnectionFailure, OperationFailure
 from requests.exceptions import HTTPError, RequestException
 from rich import print
+
+# ──────────────────────────────────────────────────────────────
+# fuzzy sub-category resolver
+# ──────────────────────────────────────────────────────────────
+_SUBCAT_DICT = {
+    "house": {
+        "detached house", "semi-detached house", "terraced house",
+        "end of terrace house", "mid terrace house", "town house",
+        "mews house", "character property",
+    },
+    "flat": {
+        "apartment", "apartments", "studio", "duplex",
+        "flat", "penthouse", "maisonette",
+    },
+    "other": {"house boat", "houseboat"},
+}
+
+_LOOKUP = {
+    synonym: canon
+    for canon, synonyms in _SUBCAT_DICT.items()
+    for synonym in synonyms
+}
+
+
+def normalise_subcategory(user_value: str) -> Optional[str]:
+    """
+    Map free-form text to 'house' | 'flat' | 'other'.
+    Case-insensitive; fuzzy (≥ 0.8 similarity); returns None if unknown.
+    """
+    if not user_value:
+        return None
+
+    val = user_value.strip().lower()
+
+    if val in _LOOKUP:                       # exact synonym
+        return _LOOKUP[val]
+
+    close = get_close_matches(val, _LOOKUP.keys(), n=1, cutoff=0.8)
+    return _LOOKUP[close[0]] if close else None
+
 
 # ──────────────────────────────────────────────────────────────
 # configuration
@@ -122,9 +168,14 @@ class PropertyRepository:
             raise ValueError("keyword required")
 
         purpose = p.get("purpose")  # None, "sale", or "rental"
+        canon = normalise_subcategory(p.get("subcategory", ""))
+
         base: Dict[str, Any] = {}
         if purpose and purpose != "all":
             base["purpose"] = purpose
+        if canon:
+            # case-insensitive match against the subcategories array field
+            base["subcategories"] = {"$regex": canon, "$options": "i"}
 
         beds_min, baths_min = p.get("beds_min"), p.get("baths_min")
         price_min, price_max = p.get("price_min"), p.get("price_max")
@@ -158,10 +209,10 @@ class PropertyRepository:
             return q
 
         tiers: List[Tuple[str, Dict[str, Any]]] = [
-            ("full", apply_nums(base | text_stage, "full")),
-            ("no_price", apply_nums(base | text_stage, "no_price")),
-            ("no_beds_baths", apply_nums(base | text_stage, "no_beds_baths")),
-            ("location_only", base | regex_stage),
+            ("full",           apply_nums(base | text_stage, "full")),
+            ("no_price",       apply_nums(base | text_stage, "no_price")),
+            ("no_beds_baths",  apply_nums(base | text_stage, "no_beds_baths")),
+            ("location_only",  base | regex_stage),
         ]
 
         for name, q in tiers:
