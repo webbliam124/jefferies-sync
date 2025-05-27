@@ -31,6 +31,52 @@ from pymongo.errors import ConnectionFailure, OperationFailure
 from requests.exceptions import HTTPError, RequestException
 from rich import print
 
+from difflib import get_close_matches
+from typing import Optional
+
+_SUBCAT_DICT = {
+    "house": {
+        "detached house", "semi-detached house", "terraced house",
+        "end of terrace house", "mid terrace house", "town house",
+        "mews house", "character property",
+    },
+    "flat": {
+        "apartment", "apartments", "studio", "duplex",
+        "flat", "penthouse", "maisonette",
+    },
+    "other": {"house boat", "houseboat"},
+}
+
+_LOOKUP = {
+    synonym: canon
+    for canon, synonyms in _SUBCAT_DICT.items()
+    for synonym in synonyms
+}
+
+
+def normalise_subcategory(user_value: str) -> Optional[str]:
+    """
+    Map a free-form subcategory string to 'house' | 'flat' | 'other'.
+    Case-insensitive and tolerant of minor typos.
+    Returns None if unrecognised.
+    """
+    if not user_value:
+        return None
+
+    val = user_value.strip().lower()
+
+    # Exact synonym?
+    if val in _LOOKUP:
+        return _LOOKUP[val]
+
+    # Fuzzy match ≥ 0.8
+    close = get_close_matches(val, _LOOKUP.keys(), n=1, cutoff=0.8)
+    if close:
+        return _LOOKUP[close[0]]
+
+    return None
+
+
 # ──────────────────────────────────────────────────────────────
 # configuration
 # ──────────────────────────────────────────────────────────────

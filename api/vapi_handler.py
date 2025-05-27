@@ -26,6 +26,7 @@ from property_search import (  # type: ignore  # pylint: disable=import-error
     PropertyRepository,
     summarise,
     send_whatsapp,
+    normalise_subcategory,
 )
 
 import io
@@ -139,10 +140,21 @@ class handler(BaseHTTPRequestHandler):  # pylint: disable=invalid-name
                     {"toolCallId": tc_id, "result": "location is required"})
                 continue
 
-            query = {"keyword": loc, "purpose": args.get("purpose", "all")}
+            query: Dict[str, Any] = {
+                "keyword": loc,
+                "purpose": args.get("purpose", "all"),
+            }
+
             for fld in ("beds_min", "baths_min", "price_min", "price_max"):
                 if fld in args and args[fld] is not None:
                     query[fld] = args[fld]
+
+            # ── NEW subcategory support ───────────────────────────────────
+            canon = normalise_subcategory((args.get("subcategory") or ""))
+            if canon:
+                # case-insensitive wildcard against listing.subcategories array
+                query["subcategories"] = {"$regex": canon, "$options": "i"}
+            # ──────────────────────────────────────────────────────────────
 
             # ----- search --------------------------------------------------
             try:
