@@ -3,17 +3,18 @@
 property_search.py — Mongo search + WhatsApp notify
 ===================================================
 
-Searches MongoDB for a matching property and sends a WhatsApp template
-(send_property).  The CLI also prints a compact JSON summary.
+Searches MongoDB for a property and (optionally) sends a WhatsApp
+template.  Also usable as a CLI utility.
 
-NEW 2025-05-26
+NEW 2025-05-27
 ──────────────
-• Added --purpose {sale|rental|all}  (defaults to all)
-• Replaced the old --status filter in the query tiers
+• Added fuzzy `subcategory` filter (“penthouse”, “terraced house”, …)
+• Keeps earlier --purpose / --status changes.
 """
 
 from __future__ import annotations
 
+# ───────────── stdlib
 import argparse
 import json
 import logging
@@ -21,8 +22,10 @@ import os
 import re
 import sys
 from dataclasses import dataclass
+from difflib import get_close_matches
 from typing import Any, Dict, List, Optional, Tuple
 
+# ───────────── 3rd-party
 import requests
 from dotenv import load_dotenv
 from pymongo import ASCENDING, MongoClient, TEXT
@@ -31,9 +34,9 @@ from pymongo.errors import ConnectionFailure, OperationFailure
 from requests.exceptions import HTTPError, RequestException
 from rich import print
 
-from difflib import get_close_matches
-from typing import Optional
-
+# ──────────────────────────────────────────────────────────────
+# fuzzy sub-category resolver
+# ──────────────────────────────────────────────────────────────
 _SUBCAT_DICT = {
     "house": {
         "detached house", "semi-detached house", "terraced house",
@@ -56,25 +59,19 @@ _LOOKUP = {
 
 def normalise_subcategory(user_value: str) -> Optional[str]:
     """
-    Map a free-form subcategory string to 'house' | 'flat' | 'other'.
-    Case-insensitive and tolerant of minor typos.
-    Returns None if unrecognised.
+    Map free-form text to 'house' | 'flat' | 'other'.
+    Case-insensitive; fuzzy (≥ 0.8 similarity).
     """
     if not user_value:
         return None
 
     val = user_value.strip().lower()
 
-    # Exact synonym?
-    if val in _LOOKUP:
+    if val in _LOOKUP:                       # exact synonym
         return _LOOKUP[val]
 
-    # Fuzzy match ≥ 0.8
     close = get_close_matches(val, _LOOKUP.keys(), n=1, cutoff=0.8)
-    if close:
-        return _LOOKUP[close[0]]
-
-    return None
+    return _LOOKUP[close[0]] if close else None
 
 
 # ──────────────────────────────────────────────────────────────
@@ -121,7 +118,7 @@ class Settings:
 # mongo repository
 # ──────────────────────────────────────────────────────────────
 class PropertyRepository:
-    """Simple DAO and tiered search over the `properties` collection."""
+    """DAO + tiered search over the *properties* collection."""
 
     def __init__(self, cfg: Settings):
         self._client = MongoClient(cfg.mongodb_uri, tz_aware=True)
@@ -153,7 +150,7 @@ class PropertyRepository:
                 text_keys, name="text_search", default_language="english"
             )
         except OperationFailure as exc:
-            if exc.code == 85:  # IndexOptionsConflict
+            if exc.code == 85:        # IndexOptionsConflict
                 self._col.drop_index("text_search")
                 self._col.create_index(
                     text_keys, name="text_search", default_language="english"
@@ -167,13 +164,21 @@ class PropertyRepository:
         if not key:
             raise ValueError("keyword required")
 
-        purpose = p.get("purpose")  # None, "sale", or "rental"
+        # fixed filters
+        purpose = p.get("purpose")         # None | sale | rental
+        canon = normalise_subcategory(p.get("subcategory", ""))
+
         base: Dict[str, Any] = {}
         if purpose and purpose != "all":
             base["purpose"] = purpose
+        if canon:
+            # case-insensitive match against the subcategories array
+            base["subcategories"] = {"$regex": canon, "$options": "i"}
 
-        beds_min, baths_min = p.get("beds_min"), p.get("baths_min")
-        price_min, price_max = p.get("price_min"), p.get("price_max")
+        beds_min = p.get("beds_min")
+        baths_min = p.get("baths_min")
+        price_min = p.get("price_min")
+        price_max = p.get("price_max")
 
         text_stage = {"$text": {"$search": key}}
         rx = {"$regex": re.escape(key), "$options": "i"}
@@ -204,14 +209,14 @@ class PropertyRepository:
             return q
 
         tiers: List[Tuple[str, Dict[str, Any]]] = [
-            ("full", apply_nums(base | text_stage, "full")),
-            ("no_price", apply_nums(base | text_stage, "no_price")),
-            ("no_beds_baths", apply_nums(base | text_stage, "no_beds_baths")),
-            ("location_only", base | regex_stage),
+            ("full",           apply_nums(base | text_stage,     "full")),
+            ("no_price",       apply_nums(base | text_stage,     "no_price")),
+            ("no_beds_baths",  apply_nums(base | text_stage,     "no_beds_baths")),
+            ("location_only",  base | regex_stage),
         ]
 
         for name, q in tiers:
-            if "$text" in q:
+            if "$text" in q:   # full-text tier
                 cur = (
                     self._col.find(q, {"score": {"$meta": "textScore"}})
                     .sort("score", {"$meta": "textScore"})
@@ -220,20 +225,21 @@ class PropertyRepository:
                 doc = next(cur, None)
             else:
                 doc = self._col.find_one(q)
+
             if doc:
                 return doc, name
+
         return None, "none"
 
 
 # ──────────────────────────────────────────────────────────────
-# whatsapp helper  (unchanged)
+# WhatsApp helper
 # ──────────────────────────────────────────────────────────────
 def _nz(v: Optional[str]) -> str:
     return v if v and str(v).strip() else "-"
 
 
 def send_whatsapp(cfg: Settings, phone: str, summary: Dict[str, Any]) -> None:
-    """Send template *send_property* using NAMED parameters."""
     headers = {
         "Authorization": f"Bearer {cfg.waba_token}",
         "Content-Type": "application/json",
@@ -242,26 +248,14 @@ def send_whatsapp(cfg: Settings, phone: str, summary: Dict[str, Any]) -> None:
     body_params = [
         {"type": "text", "parameter_name": "location",
             "text": _nz(summary["address"])},
-        {
-            "type": "text",
-            "parameter_name": "price",
-            "text": _nz(summary.get("price") or summary["marketing"]["heading"]),
-        },
-        {
-            "type": "text",
-            "parameter_name": "bedrooms",
-            "text": _nz(summary["amenities"].get("beds")),
-        },
-        {
-            "type": "text",
-            "parameter_name": "bathrooms",
-            "text": _nz(summary["amenities"].get("baths")),
-        },
-        {
-            "type": "text",
-            "parameter_name": "size",
-            "text": _nz(summary.get("size")),
-        },
+        {"type": "text", "parameter_name": "price",      "text": _nz(
+            summary.get("price") or summary["marketing"]["heading"])},
+        {"type": "text", "parameter_name": "bedrooms",
+            "text": _nz(summary["amenities"].get("beds"))},
+        {"type": "text", "parameter_name": "bathrooms",
+            "text": _nz(summary["amenities"].get("baths"))},
+        {"type": "text", "parameter_name": "size",
+            "text": _nz(summary.get("size"))},
     ]
 
     payload = {
@@ -287,7 +281,7 @@ def send_whatsapp(cfg: Settings, phone: str, summary: Dict[str, Any]) -> None:
                       json=payload, timeout=10)
     try:
         r.raise_for_status()
-    except HTTPError as exc:
+    except HTTPError:
         logging.error("WhatsApp API error %s – %s", r.status_code, r.text)
         raise
     except RequestException as exc:
@@ -296,15 +290,14 @@ def send_whatsapp(cfg: Settings, phone: str, summary: Dict[str, Any]) -> None:
 
 
 # ──────────────────────────────────────────────────────────────
-# misc helpers  (unchanged)
+# misc helpers
 # ──────────────────────────────────────────────────────────────
 def _strip_house_number(a: str) -> str:
     return re.sub(r"^\s*\d+\s*", "", a).strip()
 
 
 def _pick_main_image(rec: Dict[str, Any]) -> str:
-    media = rec.get("main_image_url") or rec.get("main_image") or ""
-    return media or ""
+    return rec.get("main_image_url") or rec.get("main_image") or ""
 
 
 def summarise(rec: Dict[str, Any]) -> Dict[str, Any]:
@@ -360,9 +353,8 @@ def summarise(rec: Dict[str, Any]) -> Dict[str, Any]:
 # CLI helpers
 # ──────────────────────────────────────────────────────────────
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Property search CLI with WhatsApp auto-send")
-    p.add_argument("keyword", nargs="?", help="Location/keyword phrase")
+    p = argparse.ArgumentParser(description="Property search CLI (+ WhatsApp)")
+    p.add_argument("keyword", nargs="?", help="Location / keyword phrase")
     p.add_argument("--json", help="Inline JSON dict of filters")
     p.add_argument("--purpose", choices=["sale", "rental", "all"],
                    default="all", help="Sale, rental, or all (default)")
@@ -383,7 +375,7 @@ def _query(ns: argparse.Namespace) -> Dict[str, Any]:
 
 
 # ──────────────────────────────────────────────────────────────
-# main
+# entry-point
 # ──────────────────────────────────────────────────────────────
 def main() -> None:
     cfg = Settings.from_env()
@@ -394,6 +386,7 @@ def main() -> None:
         sys.exit(1)
 
     ns = _parse_args()
+
     try:
         doc, tier = repo.find_one(_query(ns))
     except ValueError as exc:
