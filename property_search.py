@@ -334,6 +334,18 @@ def summarise(rec: Dict[str, Any]) -> Dict[str, Any]:
         else rec.get("highlights")
     ) or ""
 
+    # Extract and normalise first subcategory (if any)
+    subcat_list = rec.get("subcategories", [])
+    canonical_subcategory = None
+    if isinstance(subcat_list, list) and subcat_list:
+        for entry in subcat_list:
+            canon = normalise_subcategory(str(entry))
+            if canon:
+                canonical_subcategory = canon
+                break
+    elif isinstance(subcat_list, str):
+        canonical_subcategory = normalise_subcategory(subcat_list)
+
     return {
         "listing_id": str(rec.get("_id")),
         "address": safe_addr,
@@ -358,6 +370,7 @@ def summarise(rec: Dict[str, Any]) -> Dict[str, Any]:
             "beds": am.get("bedrooms"),
             "baths": am.get("bathrooms"),
         },
+        "subcategory": canonical_subcategory,
     }
 
 
