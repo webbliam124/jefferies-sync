@@ -1,26 +1,21 @@
 #!/usr/bin/env python3
-# File: api/vapi_handler.py
 """
-Vapi → Property search proxy (Vercel-compatible, class-based)
+Vapi → Property search proxy (Vercel-compatible).
 
-• Exposed at   /api/vapi_handler
-• Accepts POST tool-call envelopes from Vapi (see sample body below)
-• Optionally fires WhatsApp (unless "dry": true)
-• Responds with    {"results": [{"toolCallId": "…", "result": …}]}
+• Deployed at /api/vapi_handler
+• Accepts POST tool-call envelopes from Vapi.
+• Optionally sends WhatsApp (unless {"dry": true}).
+• Replies with {"results": [{"toolCallId": "…", "result": …}]}.
 
-This module **exports a class called `handler` that subclasses
-BaseHTTPRequestHandler** – exactly what the Vercel Python runtime
-is looking for, avoiding the previous `issubclass` TypeError.
-
-NEW 2025-05-26
-──────────────
-• Added graceful handling of the nested OpenAI/Vapi tool-call format
-  ("type": "function", "function": {"name": …, "arguments": …}).
-  The code still supports the older, flatter shape to keep unit tests
-  and CLI fixtures working.
+2025-05-29  No code changes were required for the new *agent* field because
+            the handler already forwards the entire summary returned by
+            `property_search.summarise`.
+2025-05-26  Added support for OpenAI-style nested function envelopes.
 """
 
 from __future__ import annotations
+
+# local
 from property_search import (  # type: ignore  # pylint: disable=import-error
     Settings,
     PropertyRepository,
@@ -29,6 +24,7 @@ from property_search import (  # type: ignore  # pylint: disable=import-error
     normalise_subcategory,
 )
 
+# stdlib
 import io
 import json
 import sys
@@ -36,14 +32,15 @@ import traceback
 from http.server import BaseHTTPRequestHandler
 from typing import Any, Dict, List
 
+# third-party
 from dotenv import load_dotenv
 
-# helper functions live in lib/
-sys.path.append("lib")  # allow import without packaging
+# helper utilities live in lib/
+sys.path.append("lib")
 
-# ────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
 CORS = {
-    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Origin":  "*",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type",
 }
@@ -53,23 +50,23 @@ def _json_response(
     code: int,
     payload: Dict[str, Any] | List[Any] | str = "",
 ) -> tuple[int, list[tuple[str, str]], bytes]:
-    """Return (status, headers, body_bytes) – suitable for send_response."""
+    """Return `(status, headers, body_bytes)` for `send_response`."""
     headers = [("Content-Type", "application/json"), *CORS.items()]
     body = payload if isinstance(payload, str) else json.dumps(
-        payload, ensure_ascii=False)
+        payload, ensure_ascii=False
+    )
     return code, headers, body.encode()
 
-# ───────────────────────── entry-point class ───────────────────────────────
 
-
+# ───────────────────── entry-point class ──────────────────────────────
 class handler(BaseHTTPRequestHandler):  # pylint: disable=invalid-name
-    """Vercel expects this exact symbol name (`handler`)."""
+    """Vercel searches for a symbol literally called `handler`."""
 
-    # Silence default logging
-    def log_message(self, fmt, *args):  # noqa: D401
+    # suppress default access log
+    def log_message(self, *_):  # noqa: D401
         return
 
-    # -------- CORS pre-flight ---------------------------------------------
+    # CORS pre-flight ------------------------------------------------------
     def do_OPTIONS(self):  # pylint: disable=invalid-name
         code, hdrs, body = _json_response(204, "")
         self.send_response(code)
@@ -78,7 +75,7 @@ class handler(BaseHTTPRequestHandler):  # pylint: disable=invalid-name
         self.end_headers()
         self.wfile.write(body)
 
-    # -------- main POST handler -------------------------------------------
+    # POST ----------------------------------------------------------------
     def do_POST(self):  # pylint: disable=invalid-name
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -88,19 +85,22 @@ class handler(BaseHTTPRequestHandler):  # pylint: disable=invalid-name
             self._send(*_json_response(400, {"error": "invalid JSON"}))
             return
 
-        res = self._process_envelope(envelope)
-        self._send(*res)
+        self._send(*self._process_envelope(envelope))
 
-    # -------- envelope → results ------------------------------------------
-    def _process_envelope(self, env: Dict[str, Any]) -> tuple[int, list[tuple[str, str]], bytes]:
+    # logic ---------------------------------------------------------------
+    def _process_envelope(
+        self, env: Dict[str, Any]
+    ) -> tuple[int, list[tuple[str, str]], bytes]:
+
         message = env.get("message") or {}
-        # Accept both alias keys just in case Vapi changes again
-        calls: list = message.get(
-            "toolCallList") or message.get("toolCalls") or []
+        calls: list = (
+            message.get("toolCallList") or  # current Vapi name
+            message.get("toolCalls") or []  # legacy alias
+        )
         if not calls:
             return _json_response(400, {"error": "no tool calls in body"})
 
-        # One repo / cfg per lambda invocation
+        # shared resources per Lambda invocation
         try:
             load_dotenv()
             cfg = Settings.from_env()
@@ -111,85 +111,79 @@ class handler(BaseHTTPRequestHandler):  # pylint: disable=invalid-name
             return _json_response(500, {"error": f"config error: {exc}"})
 
         results = []
+
         for call in calls:
             tc_id = call.get("id", "unknown")
 
-            # → NEW: normalise OpenAI/Vapi "function" wrapper ←
-            if call.get("type") == "function":
-                fn = call.get("function") or {}
-            else:
-                fn = {}
-
-            name = fn.get("name") or call.get("name")
-            args = fn.get("arguments") or call.get("arguments") or {}
+            # unwrap OpenAI-style envelope if present
+            fn_wrapper = call.get("function") if call.get(
+                "type") == "function" else {}
+            name = fn_wrapper.get("name") or call.get("name")
+            args = fn_wrapper.get("arguments") or call.get("arguments") or {}
 
             if not name:
-                results.append(
-                    {"toolCallId": tc_id, "result": "tool name missing"})
+                results.append({"toolCallId": tc_id,
+                                "result": "tool name missing"})
                 continue
-
             if name != "find_property":
-                results.append(
-                    {"toolCallId": tc_id, "result": f"unsupported tool {name}"})
+                results.append({"toolCallId": tc_id,
+                                "result": f"unsupported tool {name}"})
                 continue
 
-            # ----- build query --------------------------------------------
+            # build query --------------------------------------------------
             loc = (args.get("location") or "").strip()
             if not loc:
-                results.append(
-                    {"toolCallId": tc_id, "result": "location is required"})
+                results.append({"toolCallId": tc_id,
+                                "result": "location is required"})
                 continue
 
             query: Dict[str, Any] = {
                 "keyword": loc,
                 "purpose": args.get("purpose", "all"),
             }
-
             for fld in ("beds_min", "baths_min", "price_min", "price_max"):
                 if fld in args and args[fld] is not None:
                     query[fld] = args[fld]
 
-            # ── NEW subcategory support ───────────────────────────────────
-            canon = normalise_subcategory((args.get("subcategory") or ""))
+            canon = normalise_subcategory(args.get("subcategory") or "")
             if canon:
-                # case-insensitive wildcard against listing.subcategories array
                 query["subcategories"] = {"$regex": canon, "$options": "i"}
-            # ──────────────────────────────────────────────────────────────
 
-            # ----- search --------------------------------------------------
+            # search -------------------------------------------------------
             try:
                 doc, _tier = repo.find_one(query)
                 if not doc:
-                    results.append(
-                        {"toolCallId": tc_id, "result": "no property found"})
+                    results.append({"toolCallId": tc_id,
+                                    "result": "no property found"})
                     continue
-                summary = summarise(doc)
+                summary = summarise(doc)          # ← includes 'agent'
             except Exception as exc:  # pylint: disable=broad-except
                 traceback.print_exc()
-                results.append(
-                    {"toolCallId": tc_id, "result": f"search error: {exc}"})
+                results.append({"toolCallId": tc_id,
+                                "result": f"search error: {exc}"})
                 continue
 
-            # ----- optional WhatsApp -------------------------------------
+            # WhatsApp (optional) -----------------------------------------
             phone = (args.get("phone_number") or "").strip()
             if phone and not args.get("dry"):
                 try:
                     send_whatsapp(cfg, phone, summary)
                     summary["whatsapp"] = "sent"
-                except Exception as exc:  # pylint: disable=broad-except
+                except Exception as exc:          # pylint: disable=broad-except
                     summary["whatsapp"] = f"error: {exc}"
 
             results.append({"toolCallId": tc_id, "result": summary})
 
         return _json_response(200, {"results": results})
 
-    # -------- send helper --------------------------------------------------
-    def _send(self, code: int, headers: list[tuple[str, str]], body: bytes):
+    # helper --------------------------------------------------------------
+    def _send(self, code: int,
+              headers: list[tuple[str, str]],
+              body: bytes):
         self.send_response(code)
         for k, v in headers:
             self.send_header(k, v)
         self.end_headers()
         if body:
-            # Avoid broken-pipe with large responses
-            buf = io.BytesIO(body)
+            buf = io.BytesIO(body)               # avoid broken-pipe
             self.wfile.write(buf.read())

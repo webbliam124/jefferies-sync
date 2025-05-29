@@ -3,21 +3,21 @@
 property_search.py — Mongo search + WhatsApp notify
 ===================================================
 
-Searches MongoDB for a matching property and sends a WhatsApp template
-(send_property).  The CLI also prints a compact JSON summary.
+Searches MongoDB for a matching property and (optionally) sends a WhatsApp
+template (`send_property`). The CLI also prints a compact JSON summary that
+now **includes the listing’s agent**.
 
-NEW 2025-05-27
-──────────────
-• Added fuzzy `subcategory` filter (e.g. "Penthouse", "terraced house").
-NEW 2025-05-26
-──────────────
-• Added --purpose {sale|rental|all}  (defaults to all)
-• Replaced the old --status filter in the query tiers
+CHANGE-LOG
+──────────
+• 2025-05-29  Add `agent` block to the summary (first negotiator in
+              `rec["agents"]`).
+• 2025-05-27  Fuzzy sub-category mapping (e.g. “penthouse”, “terraced house”…).
+• 2025-05-26  Introduced `--purpose {sale|rental|all}` flag.
 """
 
 from __future__ import annotations
 
-# stdlib
+# ── standard library ──────────────────────────────────────────────────
 import argparse
 import json
 import logging
@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from difflib import get_close_matches
 from typing import Any, Dict, List, Optional, Tuple
 
-# third-party
+# ── third-party ───────────────────────────────────────────────────────
 import requests
 from dotenv import load_dotenv
 from pymongo import ASCENDING, MongoClient, TEXT
@@ -37,9 +37,9 @@ from pymongo.errors import ConnectionFailure, OperationFailure
 from requests.exceptions import HTTPError, RequestException
 from rich import print
 
-# ──────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
 # fuzzy sub-category resolver
-# ──────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
 _SUBCAT_DICT = {
     "house": {
         "detached house", "semi-detached house", "terraced house",
@@ -61,25 +61,21 @@ _LOOKUP = {
 
 
 def normalise_subcategory(user_value: str) -> Optional[str]:
-    """
-    Map free-form text to 'house' | 'flat' | 'other'.
-    Case-insensitive; fuzzy (≥ 0.8 similarity); returns None if unknown.
-    """
+    """Return canonical sub-category name (“house”, “flat”, “other”) or None."""
     if not user_value:
         return None
 
     val = user_value.strip().lower()
-
     if val in _LOOKUP:                       # exact synonym
         return _LOOKUP[val]
 
-    close = get_close_matches(val, _LOOKUP.keys(), n=1, cutoff=0.8)
-    return _LOOKUP[close[0]] if close else None
+    hit = get_close_matches(val, _LOOKUP.keys(), n=1, cutoff=0.8)
+    return _LOOKUP[hit[0]] if hit else None
 
 
-# ──────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
 # configuration
-# ──────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
 load_dotenv(override=True)
 
 EBROCHURE_BASE = (
@@ -99,6 +95,7 @@ class Settings:
     waba_template: str = os.getenv("TEMPLATE_NAME", "send_property")
     waba_lang: str = os.getenv("TEMPLATE_LANG", "en")
 
+    # — helpers ————————————————————————————————————————————————
     @classmethod
     def from_env(cls) -> "Settings":
         uri = os.getenv("MONGODB_URI")
@@ -117,18 +114,18 @@ class Settings:
         return f"https://graph.facebook.com/v19.0/{self.waba_phone_id}/messages"
 
 
-# ──────────────────────────────────────────────────────────────
-# mongo repository
-# ──────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
+# Mongo repository / tiered search
+# ──────────────────────────────────────────────────────────────────────
 class PropertyRepository:
-    """Simple DAO and tiered search over the `properties` collection."""
+    """Thin DAO with four-tier search strategy."""
 
     def __init__(self, cfg: Settings):
         self._client = MongoClient(cfg.mongodb_uri, tz_aware=True)
         self._col: Collection = self._client[cfg.db_name][cfg.collection_name]
         self._ensure_indexes()
 
-    # ---- connectivity -----------------------------------------------------
+    # connectivity --------------------------------------------------------
     def ping(self) -> bool:
         try:
             self._client.admin.command("ping")
@@ -136,7 +133,7 @@ class PropertyRepository:
         except ConnectionFailure:
             return False
 
-    # ---- indexes ----------------------------------------------------------
+    # indexes -------------------------------------------------------------
     def _ensure_indexes(self):
         self._col.create_index([("purpose", ASCENDING)])
         text_keys = [
@@ -149,32 +146,30 @@ class PropertyRepository:
             ("features", TEXT),
         ]
         try:
-            self._col.create_index(
-                text_keys, name="text_search", default_language="english"
-            )
+            self._col.create_index(text_keys, name="text_search",
+                                   default_language="english")
         except OperationFailure as exc:
             if exc.code == 85:  # IndexOptionsConflict
                 self._col.drop_index("text_search")
-                self._col.create_index(
-                    text_keys, name="text_search", default_language="english"
-                )
+                self._col.create_index(text_keys, name="text_search",
+                                       default_language="english")
             else:
                 raise
 
-    # ---- search -----------------------------------------------------------
+    # search --------------------------------------------------------------
     def find_one(self, p: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], str]:
         key = (p.get("keyword") or "").strip()
         if not key:
             raise ValueError("keyword required")
 
-        purpose = p.get("purpose")  # None, "sale", or "rental"
+        purpose = p.get("purpose")         # "sale", "rental", or "all"
         canon = normalise_subcategory(p.get("subcategory", ""))
 
         base: Dict[str, Any] = {}
         if purpose and purpose != "all":
             base["purpose"] = purpose
         if canon:
-            # case-insensitive match against the subcategories array field
+            # case-insensitive match against listing.subcategories
             base["subcategories"] = {"$regex": canon, "$options": "i"}
 
         beds_min, baths_min = p.get("beds_min"), p.get("baths_min")
@@ -217,11 +212,9 @@ class PropertyRepository:
 
         for name, q in tiers:
             if "$text" in q:
-                cur = (
-                    self._col.find(q, {"score": {"$meta": "textScore"}})
-                    .sort("score", {"$meta": "textScore"})
-                    .limit(1)
-                )
+                cur = (self._col.find(q, {"score": {"$meta": "textScore"}})
+                       .sort("score", {"$meta": "textScore"})
+                       .limit(1))
                 doc = next(cur, None)
             else:
                 doc = self._col.find_one(q)
@@ -230,9 +223,9 @@ class PropertyRepository:
         return None, "none"
 
 
-# ──────────────────────────────────────────────────────────────
-# whatsapp helper  (unchanged)
-# ──────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
+# WhatsApp helper
+# ──────────────────────────────────────────────────────────────────────
 def _nz(v: Optional[str]) -> str:
     return v if v and str(v).strip() else "-"
 
@@ -246,27 +239,15 @@ def send_whatsapp(cfg: Settings, phone: str, summary: Dict[str, Any]) -> None:
 
     body_params = [
         {"type": "text", "parameter_name": "location",
-            "text": _nz(summary["address"])},
-        {
-            "type": "text",
-            "parameter_name": "price",
-            "text": _nz(summary.get("price") or summary["marketing"]["heading"]),
-        },
-        {
-            "type": "text",
-            "parameter_name": "bedrooms",
-            "text": _nz(summary["amenities"].get("beds")),
-        },
-        {
-            "type": "text",
-            "parameter_name": "bathrooms",
-            "text": _nz(summary["amenities"].get("baths")),
-        },
-        {
-            "type": "text",
-            "parameter_name": "size",
-            "text": _nz(summary.get("size")),
-        },
+         "text": _nz(summary["address"])},
+        {"type": "text", "parameter_name": "price",
+         "text": _nz(summary.get("price") or summary["marketing"]["heading"])},
+        {"type": "text", "parameter_name": "bedrooms",
+         "text": _nz(summary["amenities"].get("beds"))},
+        {"type": "text", "parameter_name": "bathrooms",
+         "text": _nz(summary["amenities"].get("baths"))},
+        {"type": "text", "parameter_name": "size",
+         "text": _nz(summary.get("size"))},
     ]
 
     payload = {
@@ -282,7 +263,8 @@ def send_whatsapp(cfg: Settings, phone: str, summary: Dict[str, Any]) -> None:
                     "type": "button",
                     "sub_type": "url",
                     "index": "0",
-                    "parameters": [{"type": "text", "text": summary["listing_id"]}],
+                    "parameters": [{"type": "text",
+                                    "text": summary["listing_id"]}],
                 },
             ],
         },
@@ -292,7 +274,7 @@ def send_whatsapp(cfg: Settings, phone: str, summary: Dict[str, Any]) -> None:
                       json=payload, timeout=10)
     try:
         r.raise_for_status()
-    except HTTPError as exc:
+    except HTTPError:
         logging.error("WhatsApp API error %s – %s", r.status_code, r.text)
         raise
     except RequestException as exc:
@@ -300,19 +282,20 @@ def send_whatsapp(cfg: Settings, phone: str, summary: Dict[str, Any]) -> None:
         raise
 
 
-# ──────────────────────────────────────────────────────────────
-# misc helpers  (unchanged)
-# ──────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
+# misc helpers + summary builder (agent support added)
+# ──────────────────────────────────────────────────────────────────────
 def _strip_house_number(a: str) -> str:
-    return re.sub(r"^\s*\d+\s*", "", a).strip()
+    return re.sub(r"^\\s*\\d+\\s*", "", a).strip()
 
 
 def _pick_main_image(rec: Dict[str, Any]) -> str:
-    media = rec.get("main_image_url") or rec.get("main_image") or ""
-    return media or ""
+    return rec.get("main_image_url") or rec.get("main_image") or ""
 
 
 def summarise(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a compact dict suitable for both CLI JSON and VAPI."""
+
     am = rec.get("attributes") or rec.get("attributes_full", {})
     addr = rec.get("address", {})
     addr_fmt = addr.get("formats", {})
@@ -334,7 +317,7 @@ def summarise(rec: Dict[str, Any]) -> Dict[str, Any]:
         else rec.get("highlights")
     ) or ""
 
-    # Extract and normalise first subcategory (if any)
+    # first sub-category (canonical)
     subcat_list = rec.get("subcategories", [])
     canonical_subcategory = None
     if isinstance(subcat_list, list) and subcat_list:
@@ -346,12 +329,29 @@ def summarise(rec: Dict[str, Any]) -> Dict[str, Any]:
     elif isinstance(subcat_list, str):
         canonical_subcategory = normalise_subcategory(subcat_list)
 
+    # ── NEW agent block ────────────────────────────────────────────────
+    agents_raw = rec.get("agents") or []
+    primary_agent = agents_raw[0] if agents_raw else None
+    agent_details = None
+    if primary_agent:
+        agent_details = {
+            "id":               primary_agent.get("id"),
+            "name":             primary_agent.get("name"),
+            "email":            primary_agent.get("email"),
+            "phone_mobile":     primary_agent.get("phone_mobile"),
+            "phone_direct":     primary_agent.get("phone_direct"),
+            "position":         primary_agent.get("position"),
+            "profile_image_url": primary_agent.get("profile_image_url"),
+        }
+    # ─────────────────────────────────────────────────────────────────
+
     return {
         "listing_id": str(rec.get("_id")),
         "address": safe_addr,
         "size": rec.get("size_display") or rec.get("size"),
         "price": price,
-        "ebrochure_url": rec.get("ebrochure_link") or f"{EBROCHURE_BASE}{rec.get('_id')}",
+        "ebrochure_url": rec.get("ebrochure_link")
+        or f"{EBROCHURE_BASE}{rec.get('_id')}",
         "main_image_url": _pick_main_image(rec),
         "location": {
             "postcode": addr.get("postcode"),
@@ -371,12 +371,13 @@ def summarise(rec: Dict[str, Any]) -> Dict[str, Any]:
             "baths": am.get("bathrooms"),
         },
         "subcategory": canonical_subcategory,
+        "agent": agent_details,          # << new key
     }
 
 
-# ──────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
 # CLI helpers
-# ──────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Property search CLI with WhatsApp auto-send")
@@ -400,15 +401,15 @@ def _query(ns: argparse.Namespace) -> Dict[str, Any]:
     return {"keyword": ns.keyword or "", "purpose": ns.purpose}
 
 
-# ──────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
 # main
-# ──────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
 def main() -> None:
     cfg = Settings.from_env()
     repo = PropertyRepository(cfg)
 
     if not repo.ping():
-        logging.error("MongoDB not reachable – check .env / Atlas rules")
+        logging.error("MongoDB not reachable — check .env / Atlas rules")
         sys.exit(1)
 
     ns = _parse_args()
@@ -432,9 +433,9 @@ def main() -> None:
         else:
             try:
                 send_whatsapp(cfg, ns.to, summary)
-                print(
-                    f"[green]WhatsApp template '{cfg.waba_template}' sent to {ns.to}[/]")
-            except Exception:
+                print(f"[green]WhatsApp template '{cfg.waba_template}' "
+                      f"sent to {ns.to}[/]")
+            except Exception:  # pylint: disable=broad-except
                 sys.exit(3)
 
 
