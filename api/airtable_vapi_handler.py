@@ -35,7 +35,7 @@ from dotenv import load_dotenv
 # --------------------------------------------------------------------------- #
 try:
     # When "api" is detected as a package (Vercel runtime)
-    from api.airtable_upsert import upsert_to_airtable
+    from .airtable_upsert import upsert_to_airtable
 except ModuleNotFoundError:
     # When running locally via  python api/airtable_vapi_handler.py …
     sys.path.append("api")          # add repo/api to path
