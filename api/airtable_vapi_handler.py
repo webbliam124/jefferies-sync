@@ -124,11 +124,11 @@ class handler(BaseHTTPRequestHandler):  # pylint: disable=invalid-name
 
         return _json_response(200, {"results": results})
 
-    # ---- send helper ------------------------------------------------------
-    def _send(self, code: int, headers: List[Tuple[str, str]], body: bytes):
+        # -------- helper to write response --------------------------------------
+    def _send(self, code: int, headers: list[tuple[str, str]], body: bytes):
         self.send_response(code)
         for k, v in headers:
             self.send_header(k, v)
         self.end_headers()
-        if body:
-            io.BytesIO(body).readinto(self.wfile)
+        if body:                                 # ← write the body plainly
+            self.wfile.write(body)
