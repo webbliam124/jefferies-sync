@@ -103,6 +103,12 @@ def upsert_to_airtable(payload: Dict[str, Any]) -> Dict[str, str]:
         url = f"https://api.airtable.com/v0/{base}/{table}"
         method = requests.post
 
+    # ─── DEBUG — log full request URL and Airtable's raw response ───
+    resp = method(url, headers=headers, json={"fields": fields}, timeout=10)
+    print("Airtable⇢", resp.status_code, url, resp.text, flush=True)
+    ok = resp.ok or method(url, headers=headers, json={
+                           "fields": fields}, timeout=10).ok
+
     ok = (
         method(url, headers=headers, json={"fields": fields}, timeout=10).ok or
         method(url, headers=headers, json={"fields": fields}, timeout=10).ok
