@@ -3,21 +3,30 @@
 property_search.py — Mongo search + WhatsApp notify
 ===================================================
 
-Searches MongoDB for a matching property and (optionally) sends a WhatsApp
-template (`send_property`). The CLI also prints a compact JSON summary that
-now **includes the listing’s agent**.
+A command-line and library helper that:
+
+1. Looks up a single best-match property in MongoDB with a **four-tier** fallback
+   strategy (full → no_price → no_beds_baths → location_only).
+2. Optionally WhatsApps an e-brochure using a template (if `--to` supplied and
+   `--dry` not set).
+3. Prints a compact JSON summary (now includes `agent` block).
 
 CHANGE-LOG
 ──────────
-• 2025-05-29  Add `agent` block to the summary (first negotiator in
-              `rec["agents"]`).
-• 2025-05-27  Fuzzy sub-category mapping (e.g. “penthouse”, “terraced house”…).
+• 2025-06-01  ✨ *Amenity keyword* support  
+              – new JSON/CLI `features` list, fuzzy synonym resolver, extended
+                text search and regex tiers.
+
+• 2025-05-29  Added agent details to summary.
+
+• 2025-05-27  Fuzzy sub-category mapping (“penthouse”, “terraced house”…).
+
 • 2025-05-26  Introduced `--purpose {sale|rental|all}` flag.
 """
 
 from __future__ import annotations
 
-# ── standard library ──────────────────────────────────────────────────
+# ── standard library ────────────────────────────────────────────────
 import argparse
 import json
 import logging
@@ -28,7 +37,7 @@ from dataclasses import dataclass
 from difflib import get_close_matches
 from typing import Any, Dict, List, Optional, Tuple
 
-# ── third-party ───────────────────────────────────────────────────────
+# ── third-party ─────────────────────────────────────────────────────
 import requests
 from dotenv import load_dotenv
 from pymongo import ASCENDING, MongoClient, TEXT
@@ -37,9 +46,9 @@ from pymongo.errors import ConnectionFailure, OperationFailure
 from requests.exceptions import HTTPError, RequestException
 from rich import print
 
-# ──────────────────────────────────────────────────────────────────────
-# fuzzy sub-category resolver
-# ──────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
+# sub-category + feature synonym helpers
+# ────────────────────────────────────────────────────────────────────
 _SUBCAT_DICT = {
     "house": {
         "detached house", "semi-detached house", "terraced house",
@@ -59,23 +68,40 @@ _LOOKUP = {
     for synonym in synonyms
 }
 
+# Minimal amenity-keyword map.  Grow as the data warrants.
+_FEATURE_MAP = {
+    "private garden":      {"garden", "roof garden", "roof terrace"},
+    "stairs":              {"stairs", "internal staircase", "duplex"},
+    "off-street parking":  {"off street", "private parking", "driveway"},
+    "double garage":       {"double garage", "garage en bloc"},
+    "lift":                {"lift", "elevator"},
+    "balcony":             {"balcony", "front terrace"},
+}
+
+
+def _normalise_feature(term: str) -> str:
+    """Return canonical feature keyword if recognised, else the raw term."""
+    t = term.casefold().strip()
+    for canon, syns in _FEATURE_MAP.items():
+        if t == canon or t in syns:
+            return canon
+    return t
+
 
 def normalise_subcategory(user_value: str) -> Optional[str]:
-    """Return canonical sub-category name (“house”, “flat”, “other”) or None."""
+    """Map free-form subtype → {house|flat|other} or None."""
     if not user_value:
         return None
-
-    val = user_value.strip().lower()
-    if val in _LOOKUP:                       # exact synonym
+    val = user_value.casefold().strip()
+    if val in _LOOKUP:
         return _LOOKUP[val]
-
     hit = get_close_matches(val, _LOOKUP.keys(), n=1, cutoff=0.8)
     return _LOOKUP[hit[0]] if hit else None
 
 
-# ──────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 # configuration
-# ──────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 load_dotenv(override=True)
 
 EBROCHURE_BASE = (
@@ -95,7 +121,6 @@ class Settings:
     waba_template: str = os.getenv("TEMPLATE_NAME", "send_property")
     waba_lang: str = os.getenv("TEMPLATE_LANG", "en")
 
-    # — helpers ————————————————————————————————————————————————
     @classmethod
     def from_env(cls) -> "Settings":
         uri = os.getenv("MONGODB_URI")
@@ -114,18 +139,18 @@ class Settings:
         return f"https://graph.facebook.com/v19.0/{self.waba_phone_id}/messages"
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Mongo repository / tiered search
-# ──────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
+# Mongo repository
+# ────────────────────────────────────────────────────────────────────
 class PropertyRepository:
-    """Thin DAO with four-tier search strategy."""
+    """Thin DAO with four-tier search strategy (feature-aware)."""
 
     def __init__(self, cfg: Settings):
         self._client = MongoClient(cfg.mongodb_uri, tz_aware=True)
         self._col: Collection = self._client[cfg.db_name][cfg.collection_name]
         self._ensure_indexes()
 
-    # connectivity --------------------------------------------------------
+    # connectivity ----------------------------------------------------
     def ping(self) -> bool:
         try:
             self._client.admin.command("ping")
@@ -133,7 +158,7 @@ class PropertyRepository:
         except ConnectionFailure:
             return False
 
-    # indexes -------------------------------------------------------------
+    # indexes ---------------------------------------------------------
     def _ensure_indexes(self):
         self._col.create_index([("purpose", ASCENDING)])
         text_keys = [
@@ -156,39 +181,52 @@ class PropertyRepository:
             else:
                 raise
 
-    # search --------------------------------------------------------------
+    # search ----------------------------------------------------------
     def find_one(self, p: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], str]:
         key = (p.get("keyword") or "").strip()
         if not key:
             raise ValueError("keyword required")
 
-        purpose = p.get("purpose")         # "sale", "rental", or "all"
+        purpose = p.get("purpose")
         canon = normalise_subcategory(p.get("subcategory", ""))
 
         base: Dict[str, Any] = {}
         if purpose and purpose != "all":
             base["purpose"] = purpose
         if canon:
-            # case-insensitive match against listing.subcategories
             base["subcategories"] = {"$regex": canon, "$options": "i"}
+
+        # amenity keywords -------------------------------------------
+        raw_feats: List[str] = p.get("features") or []
+        feats: List[str] = [_normalise_feature(t) for t in raw_feats]
 
         beds_min, baths_min = p.get("beds_min"), p.get("baths_min")
         price_min, price_max = p.get("price_min"), p.get("price_max")
 
-        text_stage = {"$text": {"$search": key}}
-        rx = {"$regex": re.escape(key), "$options": "i"}
-        regex_stage = {
-            "$or": [
-                {"address.postcode": rx},
-                {"address.locality": rx},
-                {"address.suburb_or_town": rx},
-                {"address.formats.full_address": rx},
-                {"advert_internet.heading": rx},
-                {"advert_internet.body": rx},
-                {"highlights.description": rx},
-                {"features": rx},
-            ]
-        }
+        # full-text tier
+        text_terms = " ".join([key, *feats]).strip()
+        text_stage = {"$text": {"$search": text_terms}}
+
+        # regex fallback tier
+        rx_key = {"$regex": re.escape(key), "$options": "i"}
+        or_bucket = [
+            {"address.postcode": rx_key},
+            {"address.locality": rx_key},
+            {"address.suburb_or_town": rx_key},
+            {"address.formats.full_address": rx_key},
+            {"advert_internet.heading": rx_key},
+            {"advert_internet.body": rx_key},
+            {"highlights.description": rx_key},
+            {"features": rx_key},
+        ]
+        for fv in feats:
+            rx_f = {"$regex": re.escape(fv), "$options": "i"}
+            or_bucket.extend([
+                {"features": rx_f},
+                {"highlights.description": rx_f},
+                {"advert_internet.body": rx_f},
+            ])
+        regex_stage = {"$or": or_bucket}
 
         def apply_nums(q: Dict[str, Any], tier: str) -> Dict[str, Any]:
             if tier != "no_price":
@@ -223,15 +261,15 @@ class PropertyRepository:
         return None, "none"
 
 
-# ──────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 # WhatsApp helper
-# ──────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 def _nz(v: Optional[str]) -> str:
     return v if v and str(v).strip() else "-"
 
 
 def send_whatsapp(cfg: Settings, phone: str, summary: Dict[str, Any]) -> None:
-    """Send template *send_property* using NAMED parameters."""
+    """Send template *send_property* with named params."""
     headers = {
         "Authorization": f"Bearer {cfg.waba_token}",
         "Content-Type": "application/json",
@@ -282,9 +320,9 @@ def send_whatsapp(cfg: Settings, phone: str, summary: Dict[str, Any]) -> None:
         raise
 
 
-# ──────────────────────────────────────────────────────────────────────
-# misc helpers + summary builder (agent support added)
-# ──────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
+# misc helpers + summary builder (agent support)
+# ────────────────────────────────────────────────────────────────────
 def _strip_house_number(a: str) -> str:
     return re.sub(r"^\\s*\\d+\\s*", "", a).strip()
 
@@ -311,13 +349,16 @@ def summarise(rec: Dict[str, Any]) -> Dict[str, Any]:
         or rec.get("price_match_sale")
     )
 
-    highlights_val = (
-        rec.get("highlights", {}).get("description")
-        if isinstance(rec.get("highlights"), dict)
-        else rec.get("highlights")
-    ) or ""
+    # highlights: list OR list-of-dicts
+    highlights_val = ""
+    if isinstance(rec.get("highlights"), list):
+        highlights_val = ", ".join(
+            d.get("description") for d in rec["highlights"] if d.get("description")
+        )
+    elif isinstance(rec.get("highlights"), dict):
+        highlights_val = rec["highlights"].get("description", "")
 
-    # first sub-category (canonical)
+    # first canonical sub-category
     subcat_list = rec.get("subcategories", [])
     canonical_subcategory = None
     if isinstance(subcat_list, list) and subcat_list:
@@ -329,21 +370,20 @@ def summarise(rec: Dict[str, Any]) -> Dict[str, Any]:
     elif isinstance(subcat_list, str):
         canonical_subcategory = normalise_subcategory(subcat_list)
 
-    # ── NEW agent block ────────────────────────────────────────────────
+    # agent ------------------------------------------
     agents_raw = rec.get("agents") or []
     primary_agent = agents_raw[0] if agents_raw else None
     agent_details = None
     if primary_agent:
         agent_details = {
-            "id":               primary_agent.get("id"),
-            "name":             primary_agent.get("name"),
-            "email":            primary_agent.get("email"),
-            "phone_mobile":     primary_agent.get("phone_mobile"),
-            "phone_direct":     primary_agent.get("phone_direct"),
-            "position":         primary_agent.get("position"),
+            "id":                primary_agent.get("id"),
+            "name":              primary_agent.get("name"),
+            "email":             primary_agent.get("email"),
+            "phone_mobile":      primary_agent.get("phone_mobile"),
+            "phone_direct":      primary_agent.get("phone_direct"),
+            "position":          primary_agent.get("position"),
             "profile_image_url": primary_agent.get("profile_image_url"),
         }
-    # ─────────────────────────────────────────────────────────────────
 
     return {
         "listing_id": str(rec.get("_id")),
@@ -371,20 +411,23 @@ def summarise(rec: Dict[str, Any]) -> Dict[str, Any]:
             "baths": am.get("bathrooms"),
         },
         "subcategory": canonical_subcategory,
-        "agent": agent_details,          # << new key
+        "agent": agent_details,
     }
 
 
-# ──────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 # CLI helpers
-# ──────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Property search CLI with WhatsApp auto-send")
-    p.add_argument("keyword", nargs="?", help="Location/keyword phrase")
+    p.add_argument("keyword", nargs="?", help="Location / keyword phrase")
     p.add_argument("--json", help="Inline JSON dict of filters")
     p.add_argument("--purpose", choices=["sale", "rental", "all"],
                    default="all", help="Sale, rental, or all (default)")
+    p.add_argument("--features",
+                   help="Comma-separated amenity keywords "
+                        "(e.g. 'garden,stairs,parking')")
     p.add_argument("--to", help="Destination MSISDN (e.g. 27764121438)")
     p.add_argument("--dry", action="store_true",
                    help="Print payload but skip WhatsApp send")
@@ -398,12 +441,16 @@ def _query(ns: argparse.Namespace) -> Dict[str, Any]:
             body["keyword"] = ns.keyword
         body.setdefault("purpose", ns.purpose)
         return body
-    return {"keyword": ns.keyword or "", "purpose": ns.purpose}
+
+    q: Dict[str, Any] = {"keyword": ns.keyword or "", "purpose": ns.purpose}
+    if ns.features:
+        q["features"] = [s.strip() for s in ns.features.split(",") if s.strip()]
+    return q
 
 
-# ──────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 # main
-# ──────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 def main() -> None:
     cfg = Settings.from_env()
     repo = PropertyRepository(cfg)
@@ -435,7 +482,7 @@ def main() -> None:
                 send_whatsapp(cfg, ns.to, summary)
                 print(f"[green]WhatsApp template '{cfg.waba_template}' "
                       f"sent to {ns.to}[/]")
-            except Exception:  # pylint: disable=broad-except
+            except Exception:  # pragma: no cover
                 sys.exit(3)
 
 
