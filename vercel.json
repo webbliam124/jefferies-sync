@@ -5,5 +5,11 @@
       "path": "/api/rex_sync",
       "schedule": "0 3 * * *"
     }
+  ],
+  "routes": [
+    {
+      "src": "/api/dynamic_transfer_handler",
+      "dest": "/api/dynamic_transfer_handler.py"
+    }
   ]
 }
