@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
 """
-Instrumented warm-transfer webhook – prints every event to Vercel logs.
-Deploy, trigger a call, then run:
-
-    vercel logs jefferies-sync --prod -f
-
-…to see exactly which events reach the function and what number we return.
-If you never see type="transfer-destination-request" the assistant is
-calling the wrong tool (or no tools) – not a coding problem.
+Dynamic warm-transfer webhook for Vapi.
+• Expects a transfer-destination-request
+• Finds the agent for <listing_id> in Mongo
+• Replies with a destination JSON that Vapi dials
 """
 
 from __future__ import annotations
@@ -20,10 +16,7 @@ from typing import Any, Dict, Tuple
 from dotenv import load_dotenv
 from pymongo import MongoClient
 
-# --- utilities -------------------------------------------------------
-
-
-def _log(*msg): print(*msg, file=sys.stderr, flush=True)
+# ── helpers ──────────────────────────────────────────────────────────
 
 
 def _json(code: int, payload: Dict[str, Any] | str):
@@ -32,29 +25,30 @@ def _json(code: int, payload: Dict[str, Any] | str):
                        else json.dumps(payload)).encode()
 
 
-def _norm(num: str | None):
-    if not num:
+def _log(*m): print(*m, file=sys.stderr, flush=True)
+
+
+def _norm(n: str | None) -> str | None:
+    if not n:
         return None
-    num = re.sub(r"[^\d+]", "", num)
-    if num.startswith("+"):
-        return num
-    if num.startswith("0"):
-        return os.getenv("COUNTRY_DIAL_CODE", "+44")+num.lstrip("0")
-    if len(num) > 10:
-        return "+"+num
+    n = re.sub(r"[^\d+]", "", n)
+    if n.startswith("+"):
+        return n
+    if n.startswith("0"):
+        return os.getenv("COUNTRY_DIAL_CODE", "+44")+n.lstrip("0")
+    if len(n) > 10:
+        return "+"+n
     return None
 
-# --- HTTP handler ----------------------------------------------------
+# ── HTTP entry-point ─────────────────────────────────────────────────
 
 
-class handler(BaseHTTPRequestHandler):                                    # noqa: N801
-    # silence std log
+class handler(BaseHTTPRequestHandler):                                   # noqa: N801
     def log_message(self, *_): return
 
-    def do_OPTIONS(self): self._send(
-        *_json(204, ""))                     # CORS pre-flight
+    def do_OPTIONS(self): self._send(*_json(204, ""))
 
-    def do_POST(self):                                                    # main entry
+    def do_POST(self):
         try:
             body = self.rfile.read(
                 int(self.headers.get("Content-Length", "0")))
@@ -62,21 +56,17 @@ class handler(BaseHTTPRequestHandler):                                    # noqa
         except Exception:
             return self._send(*_json(200, {"error": "invalid JSON"}))
 
-        etype = evt.get("type")
-        _log("► webhook type:", etype)
-
-        if etype != "transfer-destination-request":
-            # ignore all others politely
-            return self._send(*_json(200, {}))
+        if evt.get("type") != "transfer-destination-request":
+            return self._send(*_json(200, {}))        # ignore other events
 
         self._send(*self._handle(evt))
 
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------
     def _handle(self, evt: Dict[str, Any]):
         art = evt.get("artifact") or {}
         args = (art.get("toolCall") or {}).get("arguments") or {}
         lid = args.get("listing_id")
-        _log("  listing_id:", lid)
+        _log("listing_id:", lid)
 
         if not lid:
             return _json(200, {"error": "missing listing_id"})
@@ -88,7 +78,6 @@ class handler(BaseHTTPRequestHandler):                                    # noqa
                 os.getenv("COLLECTION_NAME", "properties")]
             rec = col.find_one({"_id": lid}) or col.find_one({"id": lid})
         except Exception as exc:
-            _log("  DB error:", exc)
             return _json(200, {"error": f"DB error:{exc}"})
 
         if not rec:
@@ -97,19 +86,20 @@ class handler(BaseHTTPRequestHandler):                                    # noqa
         ag = (rec.get("agents") or [{}])[0]
         phones = [ag.get("phone_mobile"), ag.get("phone_direct"),
                   os.getenv("FALLBACK_NUMBER")]
-        num = next((n for n in (_norm(p) for p in phones) if n), None)
-        _log("  number chosen:", num)
+        number = next((n for n in (_norm(p) for p in phones) if n), None)
+        _log("dial:", number)
 
-        if not num:
+        if not number:
             return _json(200, {"error": "no valid phone"})
 
         dest = {
-            "type": "number", "number": num,
+            "type": "number",
+            "number": number,
             "message": f"Connecting you to {ag.get('name', 'our negotiator')}.",
             "callerId": os.getenv("DEFAULT_CALLER_ID", ""),
             "transferPlan": {
                 "mode": "warm-transfer-experimental",
-                "fallbackPlan": {"message": "Agent did not answer.",
+                "fallbackPlan": {"message": "The agent did not answer.",
                                  "endCallEnabled": False}
             }
         }
@@ -117,7 +107,6 @@ class handler(BaseHTTPRequestHandler):                                    # noqa
 
     def _send(self, code: int, hdr: list, body: bytes):
         self.send_response(code)
-        for k, v in hdr:
-            self.send_header(k, v)
+        [self.send_header(k, v) for k, v in hdr]
         self.end_headers()
         self.wfile.write(body)
