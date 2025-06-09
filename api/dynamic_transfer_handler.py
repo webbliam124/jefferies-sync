@@ -1,177 +1,123 @@
 #!/usr/bin/env python3
 """
-/api/dynamic_transfer_handler.py
-────────────────────────────────
-Dynamic warm-transfer webhook for Vapi.
+Instrumented warm-transfer webhook – prints every event to Vercel logs.
+Deploy, trigger a call, then run:
 
-• Looks up an agent’s phone from MongoDB using `listing_id`
-• Normalises into E.164 (+44 default)
-• Returns warm-transfer-experimental JSON with a summary + voicemail fallback
-• Never lets the call drop: unknown events and internal errors are handled
-  with HTTP 200 and an {error: "..."} payload so control stays with the AI.
+    vercel logs jefferies-sync --prod -f
 
-ENV VARS  (Vercel → Settings → Environment)
-────────
-MONGODB_URI        Mongo Atlas SRV
-DB_NAME            default JefferiesJames
-COLLECTION_NAME    default properties
-DEFAULT_CALLER_ID  CLI shown to the agent (optional)
-COUNTRY_DIAL_CODE  default “+44”
-FALLBACK_NUMBER    office line if agent has no number (optional)
+…to see exactly which events reach the function and what number we return.
+If you never see type="transfer-destination-request" the assistant is
+calling the wrong tool (or no tools) – not a coding problem.
 """
 
 from __future__ import annotations
-
-# ── stdlib ───────────────────────────────────────────────────────────
 import json
 import os
 import re
+import sys
 from http.server import BaseHTTPRequestHandler
 from typing import Any, Dict, Tuple
-
-# ── third-party ──────────────────────────────────────────────────────
 from dotenv import load_dotenv
 from pymongo import MongoClient
 
-# ─────────────────────────────────────────────────────────────────────
-CORS = {
-    "Access-Control-Allow-Origin":  "*",
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
-}
+# --- utilities -------------------------------------------------------
 
 
-def _json(code: int, payload: Dict[str, Any] | str) -> Tuple[int, list[tuple[str, str]], bytes]:
-    headers = [("Content-Type", "application/json"), *CORS.items()]
-    body = payload if isinstance(payload, str) else json.dumps(
-        payload, ensure_ascii=False)
-    return code, headers, body.encode()
+def _log(*msg): print(*msg, file=sys.stderr, flush=True)
 
 
-# --- phone normaliser ------------------------------------------------
-def _normalise(num: str | None) -> str | None:
-    """Return E.164 number (UK default)."""
+def _json(code: int, payload: Dict[str, Any] | str):
+    hdr = [("Content-Type", "application/json")]
+    return code, hdr, (payload if isinstance(payload, str)
+                       else json.dumps(payload)).encode()
+
+
+def _norm(num: str | None):
     if not num:
         return None
     num = re.sub(r"[^\d+]", "", num)
     if num.startswith("+"):
         return num
     if num.startswith("0"):
-        return os.getenv("COUNTRY_DIAL_CODE", "+44") + num.lstrip("0")
-    if len(num) > 10 and num[0].isdigit():
-        return "+" + num
+        return os.getenv("COUNTRY_DIAL_CODE", "+44")+num.lstrip("0")
+    if len(num) > 10:
+        return "+"+num
     return None
 
+# --- HTTP handler ----------------------------------------------------
 
-# ────────────────────────── HTTP entry-point recognised by Vercel ────
+
 class handler(BaseHTTPRequestHandler):                                    # noqa: N801
-    """Vercel expects a symbol literally called `handler`."""
+    # silence std log
+    def log_message(self, *_): return
 
-    # silence default log
-    def log_message(self, *_):
-        return
+    def do_OPTIONS(self): self._send(
+        *_json(204, ""))                     # CORS pre-flight
 
-    # CORS pre-flight
-    def do_OPTIONS(self):                                                 # pylint: disable=invalid-name
-        self._respond(*_json(204, ""))
-
-    # POST
-    def do_POST(self):                                                    # pylint: disable=invalid-name
+    def do_POST(self):                                                    # main entry
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            event = json.loads(self.rfile.read(length) or "{}")
+            body = self.rfile.read(
+                int(self.headers.get("Content-Length", "0")))
+            evt = json.loads(body or "{}")
         except Exception:
-            return self._respond(*_json(200, {"error": "invalid JSON"}))
+            return self._send(*_json(200, {"error": "invalid JSON"}))
 
-        # Ignore any webhook that is NOT a transfer-destination request
-        if event.get("type") != "transfer-destination-request":
-            # noop → AI continues
-            return self._respond(*_json(200, {}))
+        etype = evt.get("type")
+        _log("► webhook type:", etype)
 
-        self._respond(*self._handle(event))
+        if etype != "transfer-destination-request":
+            # ignore all others politely
+            return self._send(*_json(200, {}))
 
-    # ─────────────── core logic ───────────────────────────────────────
-    def _handle(self, event: Dict[str, Any]) -> Tuple[int, list[tuple[str, str]], bytes]:
-        artefact = event.get("artifact") or {}
-        args = (artefact.get("toolCall") or {}).get("arguments") or {}
-        listing_id = args.get("listing_id")
+        self._send(*self._handle(evt))
 
-        if not listing_id:
+    # ------------------------------------------------------------------
+    def _handle(self, evt: Dict[str, Any]):
+        art = evt.get("artifact") or {}
+        args = (art.get("toolCall") or {}).get("arguments") or {}
+        lid = args.get("listing_id")
+        _log("  listing_id:", lid)
+
+        if not lid:
             return _json(200, {"error": "missing listing_id"})
 
-        # 1. Mongo fetch ------------------------------------------------
         try:
-            load_dotenv()  # allow local .env for dev
-            client = MongoClient(os.environ["MONGODB_URI"], tz_aware=True)
-            col = client[
-                os.getenv("DB_NAME", "JefferiesJames")
-            ][os.getenv("COLLECTION_NAME", "properties")]
-
-            rec = col.find_one({"_id": listing_id}) or col.find_one(
-                {"id": listing_id})
+            load_dotenv()
+            col = MongoClient(os.environ["MONGODB_URI"], tz_aware=True)[
+                os.getenv("DB_NAME", "JefferiesJames")][
+                os.getenv("COLLECTION_NAME", "properties")]
+            rec = col.find_one({"_id": lid}) or col.find_one({"id": lid})
         except Exception as exc:
-            return _json(200, {"error": f"DB error: {exc}"})
+            _log("  DB error:", exc)
+            return _json(200, {"error": f"DB error:{exc}"})
 
         if not rec:
             return _json(200, {"error": "listing not found"})
 
-        # 2. Agent phone selection -------------------------------------
-        agent = (rec.get("agents") or [{}])[0]
+        ag = (rec.get("agents") or [{}])[0]
+        phones = [ag.get("phone_mobile"), ag.get("phone_direct"),
+                  os.getenv("FALLBACK_NUMBER")]
+        num = next((n for n in (_norm(p) for p in phones) if n), None)
+        _log("  number chosen:", num)
 
-        phones = [
-            agent.get("phone_mobile"),
-            agent.get("phone_direct"),
-            os.getenv("FALLBACK_NUMBER"),
-        ]
-        number = next((n for n in (_normalise(p) for p in phones) if n), None)
+        if not num:
+            return _json(200, {"error": "no valid phone"})
 
-        if not number:
-            return _json(200, {"error": "no valid phone number available"})
-
-        name = agent.get("name") or "our negotiator"
-        transcript = artefact.get("transcript", "")
-
-        # 3. Build destination -----------------------------------------
-        destination = {
-            "type": "number",
-            "number": number,
+        dest = {
+            "type": "number", "number": num,
+            "message": f"Connecting you to {ag.get('name', 'our negotiator')}.",
             "callerId": os.getenv("DEFAULT_CALLER_ID", ""),
-            "message": f"Connecting you to {name}.",
             "transferPlan": {
                 "mode": "warm-transfer-experimental",
-                "message": f"Transferring a caller about listing {listing_id}.",
-                "summaryPlan": {
-                    "enabled": True,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": "Please provide a concise summary of the call."
-                        },
-                        {
-                            "role": "user",
-                            "content": (
-                                f"Listing ID: {listing_id}\n"
-                                f"Caller transcript:\n\n{transcript}\n"
-                            )
-                        }
-                    ]
-                },
-                "fallbackPlan": {
-                    "message": (
-                        "The agent did not answer. I'll stay on the line so we can "
-                        "continue our conversation."
-                    ),
-                    "endCallEnabled": False
-                }
+                "fallbackPlan": {"message": "Agent did not answer.",
+                                 "endCallEnabled": False}
             }
         }
+        return _json(200, {"destination": dest})
 
-        return _json(200, {"destination": destination})
-
-    # ───────────── helper to send the HTTP response ───────────────────
-    def _respond(self, code: int, headers: list[tuple[str, str]], body: bytes):
+    def _send(self, code: int, hdr: list, body: bytes):
         self.send_response(code)
-        for k, v in headers:
+        for k, v in hdr:
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
