@@ -3,3 +3,4 @@ pymongo[srv]
 requests
 httpx>=0.27
 rich
+aiohttp
