@@ -1,40 +1,72 @@
 #!/usr/bin/env python3
 """
-Vapi proxy:
-• If event.type == transfer-destination-request → do DB lookup & return destination
-• else → forward unchanged to TIXAE and reply 200
+api/vapi_proxy.py  —  unified proxy for Vapi->TIXAE with dynamic transfers
+
+Behaviour
+─────────
+• If Vapi POSTs a **transfer-destination-request** →
+    → look up the listing_id in MongoDB
+    → reply with {"destination": …} so Vapi bridges the call.
+
+• If the LLM mistakenly does a **phone-call-control → forward** and the
+  “number” field is a 5- or 6-digit listing ID →
+    → convert it on the fly into a transfer-destination-request
+      and handle as above.
+
+• Every other event (assistant-message, call.end, etc.) is forwarded,
+  with all original headers, to the existing TIXAE webhook
+  https://na-gcp-api.vg-stuff.com/… .
+
+Dependencies: only `pymongo` and `python-dotenv`.
 """
 
 from __future__ import annotations
-import os
+
 import json
+import os
 import re
+import ssl
 import sys
-import asyncio
-import aiohttp
-from http.server import BaseHTTPRequestHandler
-from urllib.parse import urljoin
+import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Any, Dict, Tuple
+
 from dotenv import load_dotenv
 from pymongo import MongoClient
 
-# ── config ───────────────────────────────────────────────────────────
-load_dotenv()
+# ── environment ------------------------------------------------------
 
-TIXAE_URL = "https://na-gcp-api.vg-stuff.com/v2/agents/gFMPPgOtlMcxzrwbUbEl/vapi-event"
-MONGO = MongoClient(os.environ["MONGODB_URI"])[os.getenv(
-    "DB_NAME", "JefferiesJames")][os.getenv("COLLECTION", "properties")]
-FALLBACK = os.getenv("FALLBACK_NUMBER")
+load_dotenv()  # read variables set in Vercel dashboard
+
+TIXAE_URL = (
+    "https://na-gcp-api.vg-stuff.com/v2/agents/"
+    "gFMPPgOtlMcxzrwbUbEl/vapi-event"
+)
+
+VAPI_SECRET = os.getenv("VAPI_SECRET")          # optional shared secret
+FALLBACK = os.getenv("FALLBACK_NUMBER")      # duty negotiator phone
 DIAL_CODE = os.getenv("COUNTRY_DIAL_CODE", "+27")
-CALLER_FWD = os.getenv("DEFAULT_CALLER_ID", "")
+CLI_DEFAULT = os.getenv("DEFAULT_CALLER_ID", "")
 
-# ── helpers ──────────────────────────────────────────────────────────
+COLLECTION = (
+    MongoClient(os.environ["MONGODB_URI"], tz_aware=True)
+    [os.environ["DB_NAME"]]
+    [os.environ["COLLECTION_NAME"]]
+)
+
+# ── small helpers ----------------------------------------------------
 
 
-def _json(code: int, data):                          # unified response
-    return code, [("Content-Type", "application/json")], json.dumps(data).encode()
+def _json(code: int, payload: Dict[str, Any] | str) -> Tuple[int, list, bytes]:
+    """Return (status, headers, body) for _send()."""
+    hdr = [("Content-Type", "application/json")]
+    body = payload.encode() if isinstance(
+        payload, str) else json.dumps(payload).encode()
+    return code, hdr, body
 
 
-def _norm(num: str | None) -> str | None:                 # -> E.164
+def _norm(num: str | None) -> str | None:
+    """Normalise a dial string to E.164 (“+27…”) or return None."""
     if not num:
         return None
     num = re.sub(r"[^\d+]", "", num)
@@ -43,59 +75,88 @@ def _norm(num: str | None) -> str | None:                 # -> E.164
     if num.startswith("0"):
         return DIAL_CODE + num.lstrip("0")
     if len(num) > 10:
-        return "+"+num
+        return "+" + num
     return None
 
 
-async def _pipe_to_tixae(payload: bytes, hdrs: dict[str, str] | None):
-    async with aiohttp.ClientSession() as s:
-        try:
-            await s.post(TIXAE_URL, data=payload,
-                         headers={"Content-Type": "application/json", **(hdrs or {})})
-        except Exception as e:
-            print("⚠︎ forward failed:", e, file=sys.stderr)
+def _pipe_to_tixae(payload: bytes, hdrs: dict[str, str]):
+    """Fire-and-forget forward to the original TIXAE endpoint."""
+    headers = {"Content-Type": "application/json", **hdrs}
+    req = urllib.request.Request(
+        TIXAE_URL, data=payload, headers=headers, method="POST")
+    try:
+        urllib.request.urlopen(
+            req, context=ssl.create_default_context(), timeout=5)
+    except Exception as exc:
+        print("⚠︎ forward failed:", exc, file=sys.stderr, flush=True)
 
-# ── HTTP handler ─────────────────────────────────────────────────────
+
+# ── HTTP handler -----------------------------------------------------
 
 
-class handler(BaseHTTPRequestHandler):                # noqa: N801
-    def log_message(self, *_): pass                    # silence default log
+class handler(BaseHTTPRequestHandler):  # noqa: N801 (Vercel naming)
+    def log_message(self, *_):
+        return  # silence default access log
 
+    # -----------------------------------------------------------------
     def do_POST(self):
-        raw = self.rfile.read(
-            int(self.headers.get("Content-Length", "0") or 0))
+        raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+
+        # Optional signature check
+        if VAPI_SECRET and self.headers.get("x-vapi-secret") != VAPI_SECRET:
+            return self._send(*_json(401, {"error": "unauthenticated"}))
+
         try:
             evt = json.loads(raw or "{}")
         except json.JSONDecodeError:
             return self._send(*_json(200, {"error": "invalid JSON"}))
 
-        if evt.get("type") == "transfer-destination-request":
-            return self._send(*self._handle_transfer(evt))
-        else:
-            # fire-and-forget forward; Vapi only needs 2xx
-            asyncio.run(_pipe_to_tixae(raw, dict(self.headers)))
-            return self._send(*_json(200, {"success": True}))
+        etype = evt.get("type")
 
-    # ── dynamic transfer logic ──────────────────────────────────────
-    def _handle_transfer(self, evt):
-        art = evt.get("artifact") or {}
-        tcall = art.get("toolCall") or {}
-        args = tcall.get("arguments") or {}
-        if isinstance(args, str):
+        # 1️⃣  Normal dynamic-transfer request
+        if etype == "transfer-destination-request":
+            return self._send(*self._handle_transfer(evt))
+
+        # 2️⃣  Rogue forward with a listing-id masquerading as a phone number
+        if etype == "phone-call-control" and evt.get("request") == "forward":
+            num = evt.get("forwardingPhoneNumber", "")
+            if re.fullmatch(r"\d{5,6}", num):
+                synthetic = {
+                    "type": "transfer-destination-request",
+                    "phoneNumber": evt.get("callerId", ""),
+                    "artifact": {
+                        "toolCall": {"arguments": json.dumps({"listing_id": num})}
+                    },
+                }
+                return self._send(*self._handle_transfer(synthetic))
+
+        # 3️⃣  Everything else → straight to TIXAE
+        _pipe_to_tixae(raw, dict(self.headers))
+        return self._send(*_json(200, {"success": True}))
+
+    # -----------------------------------------------------------------
+    def _handle_transfer(self, evt: Dict[str, Any]):
+        args_raw = (
+            evt.get("artifact") or {}
+        ).get("toolCall", {}).get("arguments", {})
+        if isinstance(args_raw, str):
             try:
-                args = json.loads(args)
-            except:
-                args = {}
-        lid = args.get("listing_id")
-        if not lid:                 # missing argument
+                args_raw = json.loads(args_raw)
+            except json.JSONDecodeError:
+                args_raw = {}
+
+        listing_id = args_raw.get("listing_id")
+        if not listing_id:
             return _json(200, {"error": "missing listing_id"})
 
-        rec = MONGO.find_one({"_id": lid}) or MONGO.find_one({"id": lid})
+        rec = COLLECTION.find_one({"_id": listing_id}) or COLLECTION.find_one(
+            {"id": listing_id}
+        )
         agent = (rec.get("agents") or [{}])[0] if rec else {}
+
         phones = [agent.get("phone_mobile"), agent.get(
             "phone_direct"), FALLBACK]
         number = next((n for n in (_norm(p) for p in phones) if n), None)
-
         if not number:
             return _json(200, {"error": "no valid phone"})
 
@@ -103,19 +164,28 @@ class handler(BaseHTTPRequestHandler):                # noqa: N801
             "type": "number",
             "number": number,
             "message": f"Connecting you to {agent.get('name', 'our negotiator')}.",
-            "callerId": evt.get("phoneNumber", CALLER_FWD),
+            "callerId": evt.get("phoneNumber", CLI_DEFAULT),
             "numberE164CheckEnabled": True,
             "transferPlan": {
                 "mode": "warm-transfer-experimental",
-                "fallbackPlan": {"message": "The agent did not answer.", "endCallEnabled": False}
-            }
+                "fallbackPlan": {
+                    "message": "The agent did not answer.",
+                    "endCallEnabled": False,
+                },
+            },
         }
         return _json(200, {"destination": dest})
 
-    # ── low-level I/O helper ────────────────────────────────────────
-    def _send(self, code, hdrs, body):
+    # -----------------------------------------------------------------
+    def _send(self, code: int, hdrs: list, body: bytes):
         self.send_response(code)
         for k, v in hdrs:
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
+
+
+# ── local smoke-test -------------------------------------------------
+if __name__ == "__main__":
+    print("★ proxy listening on http://0.0.0.0:8000", file=sys.stderr)
+    HTTPServer(("", 8000), handler).serve_forever()
