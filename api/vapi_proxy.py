@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-api/vapi_proxy.py  —  unified proxy for Vapi->TIXAE with dynamic transfers
+api/vapi_proxy.py  —  Vapi → TIXAE proxy with dynamic transfers (UK numbers default)
 
 Behaviour
 ─────────
@@ -45,7 +45,7 @@ TIXAE_URL = (
 
 VAPI_SECRET = os.getenv("VAPI_SECRET")          # optional shared secret
 FALLBACK = os.getenv("FALLBACK_NUMBER")      # duty negotiator phone
-DIAL_CODE = os.getenv("COUNTRY_DIAL_CODE", "+27")
+DIAL_CODE = os.getenv("COUNTRY_DIAL_CODE", "+44")
 CLI_DEFAULT = os.getenv("DEFAULT_CALLER_ID", "")
 
 COLLECTION = (
@@ -66,7 +66,7 @@ def _json(code: int, payload: Dict[str, Any] | str) -> Tuple[int, list, bytes]:
 
 
 def _norm(num: str | None) -> str | None:
-    """Normalise a dial string to E.164 (“+27…”) or return None."""
+    """Normalise a dial string to E.164 (“+44…”) or return None."""
     if not num:
         return None
     num = re.sub(r"[^\d+]", "", num)
@@ -102,8 +102,11 @@ class handler(BaseHTTPRequestHandler):  # noqa: N801 (Vercel naming)
     def do_POST(self):
         raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
 
-        # Optional signature check
-        if VAPI_SECRET and self.headers.get("x-vapi-secret") != VAPI_SECRET:
+        # Optional signature check (accept legacy "secret" header too)
+        hdr_secret = self.headers.get
+        if VAPI_SECRET and hdr_secret("x-vapi-secret") != VAPI_SECRET and hdr_secret("secret") != VAPI_SECRET:
+            print("⚠︎ header secret mismatch",
+                  self.headers.get("x-vapi-secret"), file=sys.stderr, flush=True)
             return self._send(*_json(401, {"error": "unauthenticated"}))
 
         try:
