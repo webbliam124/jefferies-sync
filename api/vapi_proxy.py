@@ -1,28 +1,22 @@
 #!/usr/bin/env python3
 """
-api/vapi_proxy.py  —  Vapi → TIXAE proxy with dynamic transfers (UK numbers default)
+api/vapi_proxy.py — Vapi ⇒ TIXAE proxy with dynamic warm transfers.
 
-Behaviour
-─────────
-• If Vapi POSTs a **transfer-destination-request** →
-    → look up the listing_id in MongoDB
-    → reply with {"destination": …} so Vapi bridges the call.
-
-• If the LLM mistakenly does a **phone-call-control → forward** and the
-  “number” field is a 5- or 6-digit listing ID →
-    → convert it on the fly into a transfer-destination-request
-      and handle as above.
-
-• Every other event (assistant-message, call.end, etc.) is forwarded,
-  with all original headers, to the existing TIXAE webhook
-  https://na-gcp-api.vg-stuff.com/… .
-
-Dependencies: only `pymongo` and `python-dotenv`.
+Environment vars you need in Vercel (or locally):
+  VAPI_SECRET          shared secret Vapi sends in the request header
+  MONGODB_URI          connection string
+  DB_NAME              Mongo database name
+  COLLECTION_NAME      collection holding the listing docs
+  FALLBACK_NUMBER      duty negotiator’s mobile (E.164)
+  COUNTRY_DIAL_CODE    default +CC for normalisation (default “+44”)
+  DEFAULT_CALLER_ID    CLI to present if Vapi omits one (optional)
+  DEBUG                “1” to emit header + secret debug logs
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import ssl
@@ -36,15 +30,24 @@ from pymongo import MongoClient
 
 # ── environment ------------------------------------------------------
 
-load_dotenv()  # read variables set in Vercel dashboard
+load_dotenv()
+
+# logging config (stderr is captured by Vercel)
+logging.basicConfig(
+    stream=sys.stderr,
+    level=logging.DEBUG if os.getenv("DEBUG") == "1" else logging.INFO,
+    format="%(levelname)s %(message)s",
+)
+LOG = logging.getLogger(__name__)
 
 TIXAE_URL = (
     "https://na-gcp-api.vg-stuff.com/v2/agents/"
-    "gFMPPgOtlMcxzrwbUbEl/vapi-event"
+    "y77c1kx9fboojeu5/vapi-event"
 )
 
-VAPI_SECRET = os.getenv("VAPI_SECRET")          # optional shared secret
-FALLBACK = os.getenv("FALLBACK_NUMBER")      # duty negotiator phone
+VAPI_SECRET = os.getenv("VAPI_SECRET")
+
+FALLBACK = os.getenv("FALLBACK_NUMBER")
 DIAL_CODE = os.getenv("COUNTRY_DIAL_CODE", "+44")
 CLI_DEFAULT = os.getenv("DEFAULT_CALLER_ID", "")
 
@@ -54,11 +57,10 @@ COLLECTION = (
     [os.environ["COLLECTION_NAME"]]
 )
 
-# ── small helpers ----------------------------------------------------
+# ── helpers ----------------------------------------------------------
 
 
 def _json(code: int, payload: Dict[str, Any] | str) -> Tuple[int, list, bytes]:
-    """Return (status, headers, body) for _send()."""
     hdr = [("Content-Type", "application/json")]
     body = payload.encode() if isinstance(
         payload, str) else json.dumps(payload).encode()
@@ -88,7 +90,7 @@ def _pipe_to_tixae(payload: bytes, hdrs: dict[str, str]):
         urllib.request.urlopen(
             req, context=ssl.create_default_context(), timeout=5)
     except Exception as exc:
-        print("⚠︎ forward failed:", exc, file=sys.stderr, flush=True)
+        LOG.warning("TIXAE forward failed: %s", exc)
 
 
 # ── HTTP handler -----------------------------------------------------
@@ -102,13 +104,23 @@ class handler(BaseHTTPRequestHandler):  # noqa: N801 (Vercel naming)
     def do_POST(self):
         raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
 
-        # Optional signature check (accept legacy "secret" header too)
-        hdr_secret = self.headers.get
-        if VAPI_SECRET and hdr_secret("x-vapi-secret") != VAPI_SECRET and hdr_secret("secret") != VAPI_SECRET:
-            print("⚠︎ header secret mismatch",
-                  self.headers.get("x-vapi-secret"), file=sys.stderr, flush=True)
+        # Debug dump
+        if LOG.isEnabledFor(logging.DEBUG):
+            LOG.debug("Incoming headers: %s", dict(self.headers))
+            LOG.debug("Loaded VAPI_SECRET: %s", VAPI_SECRET)
+
+        # —— shared-secret check ——————————————————————————————
+        # Accept any documented casing/name
+        incoming_secret = (
+            self.headers.get("x-vapi-secret")
+            or self.headers.get("x-vapi-signature")
+            or self.headers.get("secret")
+        )
+        if VAPI_SECRET and incoming_secret != VAPI_SECRET:
+            LOG.warning("header secret mismatch: %s", incoming_secret)
             return self._send(*_json(401, {"error": "unauthenticated"}))
 
+        # —— JSON decode ——————————————————————————————————————————
         try:
             evt = json.loads(raw or "{}")
         except json.JSONDecodeError:
@@ -120,7 +132,7 @@ class handler(BaseHTTPRequestHandler):  # noqa: N801 (Vercel naming)
         if etype == "transfer-destination-request":
             return self._send(*self._handle_transfer(evt))
 
-        # 2️⃣  Rogue forward with a listing-id masquerading as a phone number
+        # 2️⃣  Rogue forward with a listing-ID as “phone number”
         if etype == "phone-call-control" and evt.get("request") == "forward":
             num = evt.get("forwardingPhoneNumber", "")
             if re.fullmatch(r"\d{5,6}", num):
@@ -128,12 +140,14 @@ class handler(BaseHTTPRequestHandler):  # noqa: N801 (Vercel naming)
                     "type": "transfer-destination-request",
                     "phoneNumber": evt.get("callerId", ""),
                     "artifact": {
-                        "toolCall": {"arguments": json.dumps({"listing_id": num})}
+                        "toolCall": {
+                            "arguments": json.dumps({"listing_id": num})
+                        }
                     },
                 }
                 return self._send(*self._handle_transfer(synthetic))
 
-        # 3️⃣  Everything else → straight to TIXAE
+        # 3️⃣  Anything else → straight to TIXAE
         _pipe_to_tixae(raw, dict(self.headers))
         return self._send(*_json(200, {"success": True}))
 
@@ -190,5 +204,5 @@ class handler(BaseHTTPRequestHandler):  # noqa: N801 (Vercel naming)
 
 # ── local smoke-test -------------------------------------------------
 if __name__ == "__main__":
-    print("★ proxy listening on http://0.0.0.0:8000", file=sys.stderr)
+    LOG.info("★ proxy listening on http://0.0.0.0:8000")
     HTTPServer(("", 8000), handler).serve_forever()
