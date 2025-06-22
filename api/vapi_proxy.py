@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
 """
 api/vapi_proxy.py  –  robust, minimal proxy Vapi ⇒ TIXAE
+(added one DEBUG line to show the number we return)
 
-Env vars you **must** set
-─────────────────────────
-VAPI_SECRET          shared secret Vapi sends
-MONGODB_URI, DB_NAME, COLLECTION_NAME
-FALLBACK_NUMBER      duty negotiator’s mobile (+E.164)
-TIXAE_AGENT_ID       your agent id (e.g. y77c1kx9fboojeu5)
+Required env vars
+  VAPI_SECRET, MONGODB_URI, DB_NAME, COLLECTION_NAME,
+  FALLBACK_NUMBER, TIXAE_AGENT_ID
 
-Env vars that are **optional**
-──────────────────────────────
-COUNTRY_DIAL_CODE    default +CC when normalising (default “+44”)
-DEFAULT_CALLER_ID    CLI used when Vapi omits one
-DEBUG                “1” → verbose debug logs
-RETRY_TO_TIXAE       “1” → retry once after a failed forward (default 0)
+Optional
+  COUNTRY_DIAL_CODE  (default “+44”)
+  DEFAULT_CALLER_ID
+  DEBUG=1            (verbose logs)
+  RETRY_TO_TIXAE=1   (one retry on 5xx/timeout)
 """
 
 from __future__ import annotations
@@ -29,7 +26,6 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, Tuple
 from urllib.error import HTTPError, URLError
-
 from dotenv import load_dotenv
 from pymongo import MongoClient
 
@@ -81,7 +77,6 @@ def _norm(num: str | None) -> str | None:
 
 
 def _forward_to_tixae(payload: bytes, hdrs: dict[str, str]):
-    """Forward once; optionally retry once if it fails."""
     def _post():
         req = urllib.request.Request(
             TIXAE_URL,
@@ -192,6 +187,7 @@ class handler(BaseHTTPRequestHandler):  # noqa: N801
                 },
             },
         }
+        LOG.debug("→  returning destination: %s", dest["number"])
         return _json(200, {"destination": dest})
 
     # -----------------------------------------------------------------
@@ -203,7 +199,7 @@ class handler(BaseHTTPRequestHandler):  # noqa: N801
         self.wfile.write(body)
 
 
-# ── local smoke-test ─────────────────────────────────────────────────
+# ── Local smoke-test ─────────────────────────────────────────────────
 if __name__ == "__main__":
     LOG.info("★ proxy listening on http://0.0.0.0:8000")
     HTTPServer(("", 8000), handler).serve_forever()
