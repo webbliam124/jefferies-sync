@@ -1,21 +1,37 @@
 #!/usr/bin/env python3
 """
-api/vapi_proxy.py – robust Vapi ⇒ TIXAE proxy (schema-compatible)
+api/vapi_proxy.py  –  robust Vapi → TIXAE proxy (2025-06 version)
 
-Required env-vars
-─────────────────
-VAPI_SECRET            shared secret Vapi sends
-MONGODB_URI, DB_NAME, COLLECTION_NAME
-FALLBACK_NUMBER        duty negotiator’s E.164 mobile
-TIXAE_AGENT_ID         e.g. y77c1kx9fboojeu5
+───────────────────────────────────────────────────────────────────────────────
+Env-vars you MUST set in Vercel (or locally)
+───────────────────────────────────────────────────────────────────────────────
+VAPI_SECRET           shared secret Vapi sends in x-vapi-secret
+MONGODB_URI           connection string
+DB_NAME               Mongo database name
+COLLECTION_NAME       collection that stores listing docs
+FALLBACK_NUMBER       duty negotiator’s E.164 mobile  (“+44…”, “+27…”, …)
+TIXAE_AGENT_ID        e.g. y77c1kx9fboojeu5  (see TIXAE URL in dashboard)
 
-Optional
-────────
-COUNTRY_DIAL_CODE      default +CC when normalising  (default “+44”)
-DEFAULT_CALLER_ID      CLI if Vapi omits one
-OUTBOUND_CLI           fixed, Twilio-verified CLI to present on agent leg
-DEBUG=1                verbose logs
-RETRY_TO_TIXAE=1       retry once on forward failure
+Optional tweaks
+───────────────
+COUNTRY_DIAL_CODE     default +CC when normalising (“+44” if unset)
+DEFAULT_CALLER_ID     CLI if the Vapi event lacks one
+OUTBOUND_CLI          fixed, Twilio-verified CLI for the transfer leg
+DEBUG=1               verbose logs (headers + payloads)
+RETRY_TO_TIXAE=1      retry TIXAE forward once on error
+───────────────────────────────────────────────────────────────────────────────
+This proxy:
+
+• Accepts both “proper” `transfer-destination-request` and rogue
+  `phone-call-control/forward` events (with a 5- or 6-digit listing ID).
+
+• Looks up the listing → picks phone_mobile → phone_direct → FALLBACK_NUMBER.
+
+• Answers **only those two event types** with a destination object
+  (new and legacy schema in one response).  All other events are forwarded
+  unchanged to the original TIXAE webhook.
+
+• Emits one INFO line per event + deep DEBUG when DEBUG=1.
 """
 
 from __future__ import annotations
@@ -39,6 +55,8 @@ from pymongo import MongoClient
 load_dotenv()
 
 DEBUG = os.getenv("DEBUG") == "1"
+RETRY_TIXAE = os.getenv("RETRY_TO_TIXAE") == "1"
+
 logging.basicConfig(
     stream=sys.stderr,
     level=logging.DEBUG if DEBUG else logging.INFO,
@@ -46,7 +64,6 @@ logging.basicConfig(
 )
 LOG = logging.getLogger(__name__)
 if DEBUG:
-    # keep pymongo noise at WARN
     logging.getLogger("pymongo").setLevel(logging.WARNING)
 
 # ── constants ────────────────────────────────────────────────────────
@@ -55,7 +72,6 @@ FALLBACK_NUM = os.getenv("FALLBACK_NUMBER")
 DIAL_CODE = os.getenv("COUNTRY_DIAL_CODE", "+44")
 CLI_DEFAULT = os.getenv("DEFAULT_CALLER_ID", "")
 OUTBOUND_CLI = os.getenv("OUTBOUND_CLI", CLI_DEFAULT)
-RETRY_TIXAE = os.getenv("RETRY_TO_TIXAE") == "1"
 
 TIXAE_URL = (
     "https://na-gcp-api.vg-stuff.com/v2/agents/"
@@ -71,14 +87,13 @@ COLL = (
 
 
 def _json(code: int, payload: Dict[str, Any] | str) -> Tuple[int, list, bytes]:
-    """Return (status, headers, body) for _send()."""
     body = payload.encode() if isinstance(
         payload, str) else json.dumps(payload).encode()
     return code, [("Content-Type", "application/json")], body
 
 
 def _norm(num: str | None) -> str | None:
-    """Convert various dial strings to E.164 or None."""
+    """Return E.164 version of num or None."""
     if not num:
         return None
     num = re.sub(r"[^\d+]", "", num)
@@ -92,7 +107,7 @@ def _norm(num: str | None) -> str | None:
 
 
 def _post_to_tixae(blob: bytes, hdrs: dict[str, str]) -> None:
-    """Forward payload to TIXAE. One optional retry."""
+    """Fire-and-forget (with optional retry) to the legacy TIXAE webhook."""
     def _once() -> None:
         req = urllib.request.Request(
             TIXAE_URL,
@@ -100,13 +115,12 @@ def _post_to_tixae(blob: bytes, hdrs: dict[str, str]) -> None:
             headers={
                 "Content-Type": "application/json",
                 "x-request-id": hdrs.get("x-call-id", ""),
-                "user-agent": hdrs.get("user-agent", "proxy"),
             },
             method="POST",
         )
         start = time.perf_counter()
-        with urllib.request.urlopen(req, context=ssl.create_default_context(), timeout=8) as resp:
-            LOG.info("→ TIXAE %s (%.0f ms)", resp.status,
+        with urllib.request.urlopen(req, context=ssl.create_default_context(), timeout=8) as r:
+            LOG.info("→ TIXAE %s (%.0f ms)", r.status,
                      (time.perf_counter() - start) * 1000)
 
     try:
@@ -124,18 +138,17 @@ def _post_to_tixae(blob: bytes, hdrs: dict[str, str]) -> None:
 # ── HTTP handler ─────────────────────────────────────────────────────
 
 
-class handler(BaseHTTPRequestHandler):  # noqa: N801 (Vercel naming)
-    def log_message(self, *_: Any) -> None:
-        return  # silence default access log
+class handler(BaseHTTPRequestHandler):  # noqa: N801
+    def log_message(self, *_: Any) -> None:  # silence default access log
+        return
 
     # -----------------------------------------------------------------
     def do_POST(self) -> None:  # noqa: N802
         raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
-
         if DEBUG:
             LOG.debug("HDR %s", dict(self.headers) | {"bodyLen": len(raw)})
 
-        # secret check
+        # Shared-secret check
         incoming_secret = (
             self.headers.get("x-vapi-secret")
             or self.headers.get("x-vapi-signature")
@@ -144,7 +157,7 @@ class handler(BaseHTTPRequestHandler):  # noqa: N801 (Vercel naming)
         if VAPI_SECRET and incoming_secret != VAPI_SECRET:
             return self._send(*_json(401, {"error": "unauthenticated"}))
 
-        # decode & unwrap
+        # Decode JSON
         try:
             data = json.loads(raw or "{}")
         except json.JSONDecodeError:
@@ -155,11 +168,11 @@ class handler(BaseHTTPRequestHandler):  # noqa: N801 (Vercel naming)
         etype = evt.get("type")
         LOG.info("★ %s", etype)
 
-        # 1️⃣ transfer-destination-request
+        # 1️⃣ normal transfer-destination-request
         if etype == "transfer-destination-request":
             return self._send(*self._handle_transfer(evt))
 
-        # 2️⃣ rogue forward with a 5/6-digit listing ID
+        # 2️⃣ LLM issued phone-call-control/forward with a 5/6-digit listing ID
         if etype == "phone-call-control" and evt.get("request") == "forward":
             num = evt.get("forwardingPhoneNumber", "")
             if re.fullmatch(r"\d{5,6}", num):
@@ -170,13 +183,13 @@ class handler(BaseHTTPRequestHandler):  # noqa: N801 (Vercel naming)
                 }
                 return self._send(*self._handle_transfer(synthetic))
 
-        # 3️⃣ everything else → pipe to TIXAE
+        # 3️⃣ everything else → just forward; no destination!
         _post_to_tixae(raw, dict(self.headers))
         return self._send(*_json(200, {"success": True}))
 
     # -----------------------------------------------------------------
     def _handle_transfer(self, evt: Dict[str, Any]) -> Tuple[int, list, bytes]:
-        """Generate destination JSON (new and legacy schema)."""
+        """Return destination JSON in both current & legacy schema."""
         args = (evt.get("artifact") or {}).get(
             "toolCall", {}).get("arguments", {})
         if isinstance(args, str):
@@ -242,7 +255,7 @@ class handler(BaseHTTPRequestHandler):  # noqa: N801 (Vercel naming)
         self.wfile.write(body)
 
 
-# ── local smoke-test ─────────────────────────────────────────────────
+# ── local smoke test ─────────────────────────────────────────────────
 if __name__ == "__main__":
     LOG.info("★ proxy listening on http://0.0.0.0:8000 (DEBUG=%s)", DEBUG)
-    HTTPServer(("", 8000), handler).serve_forever()          
+    HTTPServer(("", 8000), handler).serve_forever()        
