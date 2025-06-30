@@ -187,16 +187,17 @@ def _postcode_tokens(pc: str | None) -> List[str]:
         return []
     t = pc.upper().strip()
     parts = t.split()
-    area = parts[0]
+    area = parts[0] if parts else ""
     sector = t if len(parts) == 2 else ""
     return list({t, area, sector[:3]} - {""})
 
 
 def _location_terms(addr: dict) -> List[str]:
+    """Postcode tokens + locality/state fields (all lower-cased, unique)."""
     return list(
         {
             *(t.lower() for t in _postcode_tokens(addr.get("postcode"))),
-            *(addr.get(k, "").lower()
+            *((addr.get(k) or "").lower()
               for k in ("locality", "suburb_or_town", "state_or_region")),
         }
         - {""}
@@ -431,7 +432,7 @@ async def sync() -> Dict[str, Any]:
 class handler(BaseHTTPRequestHandler):                           # noqa: N801
     """Entry-point expected by Vercel’s Python runtime."""
 
-    def log_message(self, *_):  # silence default logging
+    def log_message(self, *_):  # silence default access log
         return
 
     def do_GET(self):  # pylint: disable=invalid-name
