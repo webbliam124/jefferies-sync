@@ -1,491 +1,455 @@
 #!/usr/bin/env python3
+# File: api/rex_sync.py
 """
-property_search.py — smarter ranking (Jun-2025)
-===============================================
+Rex → Mongo synchroniser for Jefferies London
+─────────────────────────────────────────────
+• GET  /api/rex_sync — manual trigger (Vercel function)
+• Cron /api/rex_sync — scheduled via vercel.json
 
-This version keeps the original CLI & Vapi surface but:
-• filters by `status` (current / sold);
-• indexes `location_terms` (Chelsea, SW10, …);
-• scores up to 50 candidates on beds/baths/price/feature proximity
-  so “4-bed 5-bath flat in Chelsea” finds the best match available.
+Stores (per listing)
+• Core: id, purpose, status, price_display, beds, baths, size
+• Location: full address, lat/lon, postcode/locality tokens
+• Media: hero image URL + e-brochure link
+• Facets: tags, subcategories, features
+• People: agents[]
+• Marketing: advert_internet / brochure / stocklist
+• House-keeping: system_modtime_iso, updated_at
+
+2025-06-30  ✨  New
+• Handles April-2025 Rex API changes (attr_* keys, advert_* now optional)
+• Deletes Mongo docs no longer returned by Rex
+• Adds location_terms for richer search
+• Exposes a WSGI `handler` callable (required by Vercel ≥ 2024-12)
 """
 
 from __future__ import annotations
 
-import argparse
+import asyncio
 import json
 import logging
-import math
 import os
-import re
+import pathlib
 import sys
-from dataclasses import dataclass
-from difflib import get_close_matches
-from typing import Any, Dict, List, Optional, Tuple
+from collections import defaultdict
+from datetime import datetime, timezone
+from decimal import Decimal
+from typing import Any, Dict, List, Tuple, Generator
 
-import requests
+import httpx
 from dotenv import load_dotenv
-from pymongo import ASCENDING, MongoClient, TEXT
-from pymongo.collection import Collection
-from pymongo.errors import ConnectionFailure, OperationFailure
-from requests.exceptions import HTTPError, RequestException
-from rich import print
+from pymongo import MongoClient, UpdateOne
 
-# ───── helpers (synonyms, etc.) ────────────────────────────────────
-_SUBCAT_DICT = {
-    "house": {
-        "detached house", "semi-detached house", "terraced house",
-        "end of terrace house", "mid terrace house", "town house",
-        "mews house", "character property",
-    },
-    "flat": {
-        "apartment", "apartments", "studio", "duplex",
-        "flat", "penthouse", "maisonette",
-    },
-    "other": {"house boat", "houseboat"},
-}
-
-_LOOKUP = {syn: canon for canon, syns in _SUBCAT_DICT.items() for syn in syns}
-
-_FEATURE_MAP = {
-    "private garden":      {"garden", "roof garden", "roof terrace"},
-    "stairs":              {"stairs", "internal staircase", "duplex"},
-    "off-street parking":  {"off street", "private parking", "driveway"},
-    "double garage":       {"double garage", "garage en bloc"},
-    "lift":                {"lift", "elevator"},
-    "balcony":             {"balcony", "front terrace"},
-}
-
-
-def _normalise_feature(term: str) -> str:
-    t = term.casefold().strip()
-    for canon, syns in _FEATURE_MAP.items():
-        if t == canon or t in syns:
-            return canon
-    return t
-
-
-def normalise_subcategory(val: str) -> Optional[str]:
-    if not val:
-        return None
-    val = val.casefold().strip()
-    if val in _LOOKUP:
-        return _LOOKUP[val]
-    hit = get_close_matches(val, _LOOKUP.keys(), n=1, cutoff=0.8)
-    return _LOOKUP[hit[0]] if hit else None
-
-
-# ───── config ──────────────────────────────────────────────────────
-load_dotenv(override=True)
-
-EBROCHURE_BASE = (
-    "https://app.rexsoftware.com/public/ebrochure/"
-    "?region=eu_uk_1&account_id=3877&listing_id="
+# ───── env & logging ──────────────────────────────────────────────
+load_dotenv()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | rex_sync | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
+log = logging.getLogger(__name__)
+
+# ───── helpers ────────────────────────────────────────────────────
 
 
-@dataclass(frozen=True)
-class Settings:
-    mongodb_uri: str
-    db_name: str = "JefferiesJames"
-    collection_name: str = "properties"
-
-    waba_token: str = os.getenv("WABA_TOKEN", "")
-    waba_phone_id: str = os.getenv("WABA_PHONE_ID", "")
-    waba_template: str = os.getenv("TEMPLATE_NAME", "send_property")
-    waba_lang: str = os.getenv("TEMPLATE_LANG", "en")
-
-    @classmethod
-    def from_env(cls) -> "Settings":
-        uri = os.getenv("MONGODB_URI")
-        if not uri:
-            raise RuntimeError("MONGODB_URI missing in .env")
-        return cls(
-            uri,
-            os.getenv("DB_NAME", cls.db_name),
-            os.getenv("COLLECTION_NAME", cls.collection_name),
-        )
-
-    @property
-    def waba_endpoint(self) -> str:
-        if not self.waba_phone_id:
-            raise RuntimeError("WABA_PHONE_ID missing in .env")
-        return f"https://graph.facebook.com/v19.0/{self.waba_phone_id}/messages"
+def env(name: str, default: str | None = None) -> str:
+    v = os.getenv(name, default)
+    if v is None:
+        log.critical("Missing env var: %s", name)
+        sys.exit(1)
+    return v
 
 
-# ───── Mongo DAO ───────────────────────────────────────────────────
-class PropertyRepository:
-    """Return *best* candidate rather than first hit."""
-
-    def __init__(self, cfg: Settings):
-        self._cli = MongoClient(cfg.mongodb_uri, tz_aware=True)
-        self._col: Collection = self._cli[cfg.db_name][cfg.collection_name]
-        self._ensure_indexes()
-
-    # connectivity --------------------------------------------------
-    def ping(self) -> bool:
-        try:
-            self._cli.admin.command("ping")
-            return True
-        except ConnectionFailure:
-            return False
-
-    # indexes -------------------------------------------------------
-    def _ensure_indexes(self):
-        self._col.create_index([("purpose", ASCENDING)])
-        text = [
-            ("address.formats.full_address", TEXT),
-            ("address.locality", TEXT),
-            ("address.suburb_or_town", TEXT),
-            ("advert_internet.heading", TEXT),
-            ("advert_internet.body", TEXT),
-            ("highlights.description", TEXT),
-            ("features", TEXT),
-            ("location_terms", TEXT),
-        ]
-        try:
-            self._col.create_index(text, name="text_search",
-                                   default_language="english")
-        except OperationFailure as exc:
-            if exc.code == 85:  # changed definition
-                self._col.drop_index("text_search")
-                self._col.create_index(text, name="text_search",
-                                       default_language="english")
-            else:
-                raise
-
-    # ----------------------------------------------------------------
-    def _fetch_candidates(
-        self, base_q: Dict[str, Any], text_terms: str
-    ) -> List[Dict[str, Any]]:
-        """Return up to 50 docs sorted by textScore (if any)."""
-        q = base_q.copy()
-        if text_terms:
-            q["$text"] = {"$search": text_terms}
-            cur = (
-                self._col.find(q, {"score": {"$meta": "textScore"}})
-                .sort("score", {"$meta": "textScore"})
-                .limit(50)
-            )
-        else:
-            cur = self._col.find(q).limit(50)
-        return list(cur)
-
-    # ----------------------------------------------------------------
-    @staticmethod
-    def _num(val) -> Optional[int | float]:
-        try:
-            return int(val)
-        except (TypeError, ValueError):
-            try:
-                return float(val)
-            except Exception:
-                return None
-
-    # simple linear penalty scoring ---------------------------------
-    def _score(
-        self,
-        doc: Dict[str, Any],
-        kw_feats: List[str],
-        beds_min: Optional[int],
-        baths_min: Optional[int],
-        price_min: Optional[int],
-        price_max: Optional[int],
-        subcat: Optional[str],
-        text_score: float | None,
-    ) -> float:
-        score = text_score or 0.0
-
-        # beds / baths
-        d_beds = self._num(doc.get("beds")) or self._num(
-            doc.get("attributes", {}).get("bedrooms"))
-        d_baths = self._num(doc.get("baths")) or self._num(
-            doc.get("attributes", {}).get("bathrooms"))
-
-        if beds_min is not None:
-            score -= max(0, beds_min - (d_beds or 0)) * 5
-        if baths_min is not None:
-            score -= max(0, baths_min - (d_baths or 0)) * 5
-
-        # price window – we score **penalty per %** outside requested range
-        p = self._num(doc.get("price_match_sale"))
-        if p is not None:
-            if price_min is not None and p < price_min:
-                score -= ((price_min - p) / price_min) * 100
-            if price_max is not None and p > price_max:
-                score -= ((p - price_max) / price_max) * 100
-
-        # features (must-have missing → penalty)
-        doc_feats = {f.casefold() for f in (doc.get("features") or [])}
-        for f in kw_feats:
-            if f not in doc_feats:
-                score -= 3
-
-        # subcategory closeness
-        if subcat:
-            match = normalise_subcategory(doc.get("subcategory") or "")
-            if match != subcat:
-                if subcat == "flat" and match == "other":
-                    score -= 2
-                else:
-                    score -= 4
-
-        return score
-
-    # ----------------------------------------------------------------
-    def find_best(
-        self, params: Dict[str, Any]
-    ) -> Tuple[Optional[Dict[str, Any]], str]:
-        """Return best doc + tier label (for logging)."""
-
-        key = (params.get("keyword") or "").strip()
-        if not key:
-            raise ValueError("keyword required")
-
-        purpose = params.get("purpose")
-        status = params.get("status")        # current / sold
-        subcat = normalise_subcategory(params.get("subcategory", ""))
-        beds_min, baths_min = params.get("beds_min"), params.get("baths_min")
-        price_min, price_max = params.get("price_min"), params.get("price_max")
-        kw_feats = [_normalise_feature(t)
-                    for t in (params.get("features") or [])]
-
-        base_q: Dict[str, Any] = {}
-        if purpose and purpose != "all":
-            base_q["purpose"] = purpose
-        if status:
-            base_q["status"] = status         # Rex -> "current" / "sold"
-        if subcat:
-            base_q["subcategories"] = {"$regex": subcat, "$options": "i"}
-
-        text_terms = " ".join([key, *kw_feats]).strip()
-        cand = self._fetch_candidates(base_q, text_terms)
-        if not cand:
-            # fall back to regex-only if text search empty
-            rx = {"$regex": re.escape(key), "$options": "i"}
-            base_q["$or"] = [
-                {"address.formats.full_address": rx},
-                {"location_terms": rx},
-                {"advert_internet.body": rx},
-            ]
-            cand = self._fetch_candidates(base_q, "")
-
-        if not cand:
-            return None, "none"
-
-        # rank by score
-        best, best_score = None, -math.inf
-        for d in cand:
-            tscore = d.get("score") if isinstance(
-                d.get("score"), (int, float)) else 0
-            scr = self._score(
-                d, kw_feats, beds_min, baths_min, price_min, price_max, subcat, tscore
-            )
-            if scr > best_score:
-                best, best_score = d, scr
-
-        return best, "ranked"
-
-# ───── WhatsApp helper (unchanged) ─────────────────────────────────-
+def https(u: str) -> str:
+    return ("https:" + u) if isinstance(u, str) and u.startswith("//") else u
 
 
-def _nz(v: Optional[str]) -> str:
-    return v if v and str(v).strip() else "-"
+FT2_PER_M2 = Decimal("10.76391041671")  # exact conversion
+
+# ───── runtime constants ─────────────────────────────────────────
+RUN_ENABLED = os.getenv("ENABLE_REX_CRON", "1") == "1"
+TTL = int(os.getenv("REX_TOKEN_TTL", 604_800))  # 7 days default
+PAGE_SIZE = int(os.getenv("PAGE_SIZE", 100))
+HTTP_TIMEOUT = 15.0
+MAX_DURATION = int(os.getenv("MAX_DURATION", 55))  # Lambda safety cut-off
+
+# ───── Rex config ────────────────────────────────────────────────
+REX_EMAIL = env("REX_EMAIL")
+REX_PASSWORD = env("REX_PASSWORD")
+REX_BASE_URL = env("REX_BASE_URL").rstrip("/")
+REX_ACCOUNT_ID = env("REX_ACCOUNT_ID", "3877")
 
 
-def send_whatsapp(cfg: Settings, phone: str, summary: Dict[str, Any]) -> None:
-    headers = {"Authorization": f"Bearer {cfg.waba_token}",
-               "Content-Type": "application/json"}
-    body_params = [
-        {"type": "text", "parameter_name": "location",
-         "text": _nz(summary["address"])},
-        {"type": "text", "parameter_name": "price",
-         "text": _nz(summary.get("price") or summary["marketing"]["heading"])},
-        {"type": "text", "parameter_name": "bedrooms",
-         "text": _nz(summary["amenities"].get("beds"))},
-        {"type": "text", "parameter_name": "bathrooms",
-         "text": _nz(summary["amenities"].get("baths"))},
-        {"type": "text", "parameter_name": "size",
-         "text": _nz(summary.get("size"))},
-    ]
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": phone,
-        "type": "template",
-        "template": {
-            "name": cfg.waba_template,
-            "language": {"code": cfg.waba_lang, "policy": "deterministic"},
-            "components": [
-                {"type": "body", "parameters": body_params},
-                {"type": "button", "sub_type": "url", "index": "0",
-                 "parameters": [{"type": "text", "text": summary["listing_id"]}]},
-            ],
-        },
+def rex_url(service: str, method: str) -> str:
+    return f"{REX_BASE_URL}/v1/rex/{service}/{method}"
+
+
+# ───── Mongo config ──────────────────────────────────────────────
+MONGO_URI = env("MONGODB_URI")
+DB_NAME = env("DB_NAME", "JefferiesJames")
+client = MongoClient(MONGO_URI, tz_aware=True)
+col_prop = client[DB_NAME][env("MONGO_COLLECTION", "properties")]
+col_run = client[DB_NAME][env("MONGO_RUN_COLLECTION", "listing_changes")]
+col_dupe = client[DB_NAME][env("MONGO_DUPE_COLLECTION", "duplicate_clusters")]
+
+# ───── Rex → only request what we keep ───────────────────────────
+STATIC_EXTRAS: List[str] = [
+    "address",
+    "attributes",
+    "highlights",
+    "tags",
+    "features",
+    "subcategories",
+    "images",                     # to derive hero image
+    "listing_sale_or_rental",
+    # became optional April-2025
+    "advert_internet",
+    "advert_brochure",
+    "advert_stocklist",
+]
+
+# ───── keys to strip from Mongo on every upsert ──────────────────
+DROP_KEYS = ["images", "photos", "floorplans", "raw", "media"]
+
+# ───── flatten helpers ───────────────────────────────────────────
+
+
+def _best_area(a: dict) -> Tuple[float | None, str | None]:
+    for k in (
+        "attr_buildarea_m2",
+        "attr_landarea_m2",
+        "buildarea_m2",
+        "landarea_m2",
+    ):
+        if (v := a.get(k)) not in (None, "", 0):
+            return float(v), "m2"
+    for k, u in (
+        ("attr_buildarea", "buildarea_unit"),
+        ("attr_landarea", "landarea_unit"),
+        ("buildarea", "buildarea_unit"),
+        ("landarea", "landarea_unit"),
+    ):
+        if (v := a.get(k)) not in (None, "", 0):
+            unit = (a.get(u) or "").lower()
+            if unit in ("m2", "m²"):
+                return float(v), "m2"
+            if unit in ("ft2", "ft²", "sq ft"):
+                return float(v), "ft2"
+    return None, None
+
+
+def _sqm_sqft(a: dict) -> Tuple[float | None, float | None]:
+    v, u = _best_area(a)
+    if v is None:
+        return None, None
+    if u == "m2":
+        sqm = v
+        sqft = float((Decimal(v) * FT2_PER_M2).quantize(Decimal("0.01")))
+    else:
+        sqft = v
+        sqm = float((Decimal(v) / FT2_PER_M2).quantize(Decimal("0.01")))
+    return sqm, sqft
+
+
+def _norm_imgs(imgs: List[dict]) -> List[str]:
+    return [https(im.get("url", "")) for im in imgs if im.get("url")]
+
+
+def _agent_clean(a: dict | None) -> dict:
+    if not isinstance(a, dict):
+        return {}
+    img = a.get("profile_image", {}) if isinstance(
+        a.get("profile_image"), dict) else {}
+    return {
+        "id": a.get("id"),
+        "name": a.get("name"),
+        "first_name": a.get("first_name"),
+        "last_name": a.get("last_name"),
+        "email": a.get("email_address"),
+        "phone_mobile": a.get("phone_mobile"),
+        "phone_direct": a.get("phone_direct"),
+        "position": a.get("position"),
+        "profile_image_url": https(img.get("url", "")) if img else "",
     }
-    r = requests.post(cfg.waba_endpoint, headers=headers,
-                      json=payload, timeout=10)
-    try:
-        r.raise_for_status()
-    except HTTPError:
-        logging.error("WhatsApp API error %s – %s", r.status_code, r.text)
-        raise
-    except RequestException as exc:
-        logging.error("WhatsApp request failed – %s", exc)
-        raise
-
-# ───── summariser (unchanged except marketing fallback) ────────────
 
 
-def _strip_house_number(a: str) -> str:
-    return re.sub(r"^\s*\d+\s*", "", a).strip()
+def _list(val: Any) -> List[str]:
+    if not isinstance(val, list):
+        return []
+    out: List[str] = []
+    for item in val:
+        if isinstance(item, str):
+            out.append(item.strip())
+        elif isinstance(item, dict):
+            out.append(item.get("value") or item.get(
+                "text") or item.get("name") or "")
+    return [x for x in out if x]
 
 
-def _pick_main_image(rec: Dict[str, Any]) -> str:
-    return rec.get("main_image_url") or rec.get("main_image") or ""
+def _purpose(rec: dict) -> str | None:
+    v = rec.get("listing_sale_or_rental") or rec.get("sale_or_rental")
+    return v.lower() if isinstance(v, str) else None
 
 
-def summarise(rec: Dict[str, Any]) -> Dict[str, Any]:
-    am = rec.get("attributes") or rec.get("attributes_full", {})
-    addr = rec.get("address", {})
-    addr_fmt = addr.get("formats", {})
+def _postcode_tokens(pc: str | None) -> List[str]:
+    if not pc:
+        return []
+    t = pc.upper().strip()
+    parts = t.split()
+    area = parts[0]
+    sector = t if len(parts) == 2 else ""
+    return list({t, area, sector[:3]} - {""})
 
-    safe_addr = addr_fmt.get("hidden_address") or _strip_house_number(
-        rec.get("display_address", "")
-    )
-    price = (rec.get("price_display") or rec.get("guide_price")
-             or rec.get("price_formatted") or rec.get("price_match_sale"))
 
-    marketing_blk = (rec.get("advert_internet")
-                     or rec.get("advert_brochure")
-                     or rec.get("advert_stocklist") or {})
-
-    highlights_val = ""
-    if isinstance(rec.get("highlights"), list):
-        highlights_val = ", ".join(
-            d.get("description") for d in rec["highlights"] if d.get("description")
-        )
-    elif isinstance(rec.get("highlights"), dict):
-        highlights_val = rec["highlights"].get("description", "")
-
-    subcat_list = rec.get("subcategories", [])
-    canonical_subcategory = None
-    if isinstance(subcat_list, list):
-        for entry in subcat_list:
-            canon = normalise_subcategory(str(entry))
-            if canon:
-                canonical_subcategory = canon
-                break
-    elif isinstance(subcat_list, str):
-        canonical_subcategory = normalise_subcategory(subcat_list)
-
-    agents_raw = rec.get("agents") or []
-    primary_agent = agents_raw[0] if agents_raw else None
-    agent_details = None
-    if primary_agent:
-        agent_details = {
-            "id":                primary_agent.get("id"),
-            "name":              primary_agent.get("name"),
-            "email":             primary_agent.get("email"),
-            "phone_mobile":      primary_agent.get("phone_mobile"),
-            "phone_direct":      primary_agent.get("phone_direct"),
-            "position":          primary_agent.get("position"),
-            "profile_image_url": primary_agent.get("profile_image_url"),
+def _location_terms(addr: dict) -> List[str]:
+    return list(
+        {
+            *(t.lower() for t in _postcode_tokens(addr.get("postcode"))),
+            *(addr.get(k, "").lower()
+              for k in ("locality", "suburb_or_town", "state_or_region")),
         }
+        - {""}
+    )
+
+
+def _flatten(rec: dict) -> dict:
+    attrs = rec.get("attributes", {})
+    sqm, sqft = _sqm_sqft(attrs)
+
+    addr: dict = rec.get("address", {})
+    hero_img = _norm_imgs(rec.get("images") or [])[:1]
+
+    mod_iso = datetime.fromtimestamp(
+        int(rec.get("system_modtime", 0)), tz=timezone.utc
+    ).isoformat(timespec="seconds")
+
+    agents: List[dict] = []
+    for raw in (rec.get("listing_agent_1"), rec.get("listing_agent_2")):
+        clean = _agent_clean(raw)
+        if clean:
+            agents.append(clean)
 
     return {
-        "listing_id": str(rec.get("_id")),
-        "address":    safe_addr,
-        "size":       rec.get("size_display") or rec.get("size"),
-        "price":      price,
-        "ebrochure_url": rec.get("ebrochure_link")
-        or f"{EBROCHURE_BASE}{rec.get('_id')}",
-        "main_image_url": _pick_main_image(rec),
-        "location": {
-            "postcode": addr.get("postcode"),
-            "locality": addr.get("locality"),
-            "suburb_or_town": addr.get("suburb_or_town"),
-            "latitude": addr.get("lat") or addr.get("latitude"),
-            "longitude": addr.get("lon") or addr.get("longitude"),
-        },
-        "features":   rec.get("features") or [],
-        "highlights": highlights_val,
-        "marketing":  {
-            "heading": marketing_blk.get("heading"),
-            "body":    marketing_blk.get("body"),
-        },
-        "amenities": {
-            "beds": am.get("bedrooms"),
-            "baths": am.get("bathrooms"),
-        },
-        "subcategory": canonical_subcategory,
-        "agent":       agent_details,
+        "_id": str(rec["id"]),
+        "id": rec["id"],
+        "purpose": _purpose(rec),
+        # location
+        "address": addr,
+        "display_address": addr.get("formats", {}).get("display_address", ""),
+        "lat": addr.get("latitude") or addr.get("lat"),
+        "lon": addr.get("longitude") or addr.get("lng"),
+        "location_terms": _location_terms(addr),
+        # core
+        "price_display": rec.get("price_advertise_as", ""),
+        "status": rec.get("system_listing_state", ""),
+        "beds": attrs.get("bedrooms"),
+        "baths": attrs.get("bathrooms"),
+        "size_sqm": sqm,
+        "size_sqft": sqft,
+        "size_display": f"{sqm:.0f} m² / {sqft:.0f} ft²" if sqm and sqft else "",
+        # media
+        "main_image_url": hero_img[0] if hero_img else "",
+        "ebrochure_link": rec.get("ebrochure_link"),
+        # facets
+        "tags": rec.get("tags", []),
+        "subcategories": rec.get("subcategories", []),
+        "features": _list(rec.get("features")),
+        # people
+        "agents": agents,
+        # marketing blocks
+        "advert_internet": rec.get("advert_internet", {}),
+        "advert_brochure": rec.get("advert_brochure", {}),
+        "advert_stocklist": rec.get("advert_stocklist", {}),
+        # housekeeping
+        "system_modtime_iso": mod_iso,
+        "updated_at": datetime.now(timezone.utc),
     }
 
-# ───── CLI ---------------------------------------------------------
+
+def _diff(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, List[str]]:
+    added = set(b) - set(a)
+    removed = set(a) - set(b)
+    changed = [k for k in b if k in a and b[k] != a[k]]
+    return (
+        {"added": sorted(added), "removed": sorted(
+            removed), "changed": changed}
+        if (added or removed or changed)
+        else {}
+    )
 
 
-def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Property search CLI")
-    p.add_argument("keyword", nargs="?", help="Location / keyword phrase")
-    p.add_argument("--json", help="Inline JSON dict of filters")
-    p.add_argument("--purpose", choices=["sale", "rental", "all"],
-                   default="all")
-    p.add_argument("--features",
-                   help="Comma-separated amenity keywords "
-                        "(e.g. 'garden,stairs,parking')")
-    p.add_argument("--to", help="Destination MSISDN (e.g. 447700900123)")
-    p.add_argument("--dry", action="store_true",
-                   help="Skip WhatsApp send")
-    return p.parse_args()
+def _find_duplicates(docs: List[dict]) -> List[dict]:
+    buckets: Dict[Tuple[str, str, str], List[dict]] = defaultdict(list)
+    for d in docs:
+        if d.get("lat") is None or d.get("lon") is None:
+            continue
+        key = (
+            d.get("display_address", "").lower(),
+            f"{float(d['lat']):.6f}",
+            f"{float(d['lon']):.6f}",
+        )
+        buckets[key].append(d)
+    return [
+        {"address": k[0], "lat": k[1], "lon": k[2],
+            "ids": [x["id"] for x in v]}
+        for k, v in buckets.items()
+        if len(v) > 1
+    ]
 
 
-def _query(ns: argparse.Namespace) -> Dict[str, Any]:
-    if ns.json:
-        body = json.loads(ns.json)
-        if ns.keyword and "keyword" not in body:
-            body["keyword"] = ns.keyword
-        body.setdefault("purpose", ns.purpose)
-        return body
-    q: Dict[str, Any] = {"keyword": ns.keyword or "", "purpose": ns.purpose}
-    if ns.features:
-        q["features"] = [s.strip() for s in ns.features.split(",") if s.strip()]
-    return q
-
-# ───── main --------------------------------------------------------
-
-
-def main() -> None:
-    cfg = Settings.from_env()
-    repo = PropertyRepository(cfg)
-    if not repo.ping():
-        logging.error("MongoDB not reachable")
-        sys.exit(1)
-
-    ns = _parse_args()
+def _log_to_tmp(filename: str, data: dict) -> None:
     try:
-        doc, tier = repo.find_best(_query(ns))
-    except ValueError as exc:
-        logging.error("%s", exc)
-        sys.exit(2)
+        tmp = pathlib.Path("/tmp/logs")
+        tmp.mkdir(parents=True, exist_ok=True)
+        tmp.joinpath(filename).write_text(
+            json.dumps(data, indent=2, default=str))
+    except Exception as exc:  # pylint: disable=broad-except
+        log.warning("could not write /tmp log: %s", exc)
 
-    if not doc:
-        print("[yellow]No matching property found[/]")
-        sys.exit(4)
+# ───── sync core ─────────────────────────────────────────────────
 
-    summary = summarise(doc)
-    print(f"[bold green]Match found (tier {tier}):[/]")
-    print(json.dumps(summary, indent=2, ensure_ascii=False))
 
-    if ns.to:
-        if ns.dry:
-            print("[cyan]DRY-RUN — WhatsApp skipped[/]")
+async def sync() -> Dict[str, Any]:
+    if not RUN_ENABLED:
+        return {"disabled": True}
+
+    deadline = asyncio.get_running_loop().time() + MAX_DURATION - 5
+
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as s:
+        # 1. login
+        tok_raw = (
+            await s.post(
+                rex_url("Authentication", "login"),
+                json={
+                    "email": REX_EMAIL,
+                    "password": REX_PASSWORD,
+                    "account_id": REX_ACCOUNT_ID,
+                    "token_lifetime": TTL,
+                },
+            )
+        ).json()["result"]
+        s.headers["Authorization"] = (
+            f"Bearer {tok_raw['token'] if isinstance(tok_raw, dict) else tok_raw}"
+        )
+        log.info("Rex auth OK")
+
+        # 2. discover extra fields
+        meta = (
+            await s.post(rex_url("PublishedListings", "describe-model"), json={})
+        ).json().get("result", {})
+        extras = sorted(
+            {*STATIC_EXTRAS, *meta.get("read_extra_fields", {}).keys()})
+
+        # 3. fetch pages
+        rows, offset = [], 0
+        while True:
+            if asyncio.get_running_loop().time() > deadline:
+                raise RuntimeError("time limit hit")
+            payload = {
+                "criteria": [{"name": "system_listing_state", "value": "current"}],
+                "offset": offset,
+                "limit": PAGE_SIZE,
+                "result_format": "default_no_stubs",
+                "order_by": {"system_modtime": "ASC"},
+                "extra_options": {"extra_fields": extras},
+            }
+            batch = (
+                await s.post(rex_url("PublishedListings", "search"), json=payload)
+            ).json().get("result", {}).get("rows", [])
+            if not batch:
+                break
+            rows.extend(batch)
+            offset += PAGE_SIZE
+
+    log.info("Listings fetched: %d", len(rows))
+    if not rows:
+        return {
+            "created": 0,
+            "updated": 0,
+            "unchanged": 0,
+            "deleted": 0,
+            "duplicates": 0,
+        }
+
+    docs = [_flatten(r) for r in rows]
+    ids_current = {d["_id"] for d in docs}
+
+    existing = {e["_id"]: e for e in col_prop.find(
+        {"_id": {"$in": list(ids_current)}})}
+
+    created = updated = unchanged = 0
+    changes: Dict[str, Any] = {}
+
+    for d in docs:
+        before = existing.get(d["_id"])
+        if before is None:
+            created += 1
+            changes[d["_id"]] = {"created": True}
         else:
-            try:
-                send_whatsapp(cfg, ns.to, summary)
-                print(f"[green]WhatsApp sent to {ns.to}[/]")
-            except Exception:
-                sys.exit(3)
+            diff = _diff(before, d)
+            if diff:
+                updated += 1
+                changes[d["_id"]] = diff
+            else:
+                unchanged += 1
+
+    # 4. bulk upsert
+    ops = [
+        UpdateOne(
+            {"_id": d["_id"]},
+            {"$set": d, "$unset": {k: "" for k in DROP_KEYS}},
+            upsert=True,
+        )
+        for d in docs
+    ]
+    col_prop.bulk_write(ops, ordered=False)
+
+    # 5. purge removed listings
+    deleted = col_prop.delete_many(
+        {"_id": {"$nin": list(ids_current)}}).deleted_count
+    if deleted:
+        log.info("Listings deleted: %d", deleted)
+
+    # 6. record duplicates
+    dupes = _find_duplicates(docs)
+    if dupes:
+        col_dupe.insert_one(
+            {"ts": datetime.now(timezone.utc), "clusters": dupes}
+        )
+
+    # 7. run log
+    run_doc = {
+        "ts": datetime.now(timezone.utc),
+        "created": created,
+        "updated": updated,
+        "unchanged": unchanged,
+        "deleted": deleted,
+        "duplicates": len(dupes),
+    }
+    col_run.insert_one(run_doc)
+    _log_to_tmp(
+        f"run_{run_doc['ts']:%Y-%m-%d_%H%M}.json",
+        {**run_doc, "changes": changes},
+    )
+
+    return run_doc
+
+# ───── WSGI entry-point for Vercel ────────────────────────────────
 
 
-if __name__ == "__main__":
-    main()
+def handler(environ, start_response) -> Generator[bytes, None, None]:
+    """
+    Minimal WSGI callable expected by Vercel’s Python runtime.
+    • Always returns JSON (success or error)
+    """
+    try:
+        body = json.dumps(asyncio.run(sync()), default=str).encode()
+        status = b"200 OK"
+    except Exception as exc:  # pylint: disable=broad-except
+        log.exception("sync failed")
+        body = json.dumps({"error": str(exc)}, default=str).encode()
+        status = b"500 Internal Server Error"
+
+    headers = [(b"Content-Type", b"application/json"),
+               (b"Content-Length", str(len(body)).encode())]
+    start_response(status, headers)
+    yield body
