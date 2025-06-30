@@ -1,37 +1,24 @@
 #!/usr/bin/env python3
 """
-api/vapi_proxy.py  –  robust Vapi → TIXAE proxy (2025-06 version)
+api/vapi_proxy.py — Vapi ➜ TIXAE proxy (final, June-2025)
 
-───────────────────────────────────────────────────────────────────────────────
-Env-vars you MUST set in Vercel (or locally)
-───────────────────────────────────────────────────────────────────────────────
-VAPI_SECRET           shared secret Vapi sends in x-vapi-secret
-MONGODB_URI           connection string
-DB_NAME               Mongo database name
-COLLECTION_NAME       collection that stores listing docs
-FALLBACK_NUMBER       duty negotiator’s E.164 mobile  (“+44…”, “+27…”, …)
-TIXAE_AGENT_ID        e.g. y77c1kx9fboojeu5  (see TIXAE URL in dashboard)
+──────────────────────────────────────────────────────────────────────────────
+MUST-set env-vars
+──────────────────────────────────────────────────────────────────────────────
+VAPI_SECRET            shared secret from Vapi dashboard
+MONGODB_URI            Mongo connection string
+DB_NAME                database name
+COLLECTION_NAME        collection holding listing docs
+FALLBACK_NUMBER        duty negotiator’s E.164 mobile
+TIXAE_AGENT_ID         Tixae agent slug (e.g. y77c1kx9fboojeu5)
 
-Optional tweaks
-───────────────
-COUNTRY_DIAL_CODE     default +CC when normalising (“+44” if unset)
-DEFAULT_CALLER_ID     CLI if the Vapi event lacks one
-OUTBOUND_CLI          fixed, Twilio-verified CLI for the transfer leg
-DEBUG=1               verbose logs (headers + payloads)
-RETRY_TO_TIXAE=1      retry TIXAE forward once on error
-───────────────────────────────────────────────────────────────────────────────
-This proxy:
-
-• Accepts both “proper” `transfer-destination-request` and rogue
-  `phone-call-control/forward` events (with a 5- or 6-digit listing ID).
-
-• Looks up the listing → picks phone_mobile → phone_direct → FALLBACK_NUMBER.
-
-• Answers **only those two event types** with a destination object
-  (new and legacy schema in one response).  All other events are forwarded
-  unchanged to the original TIXAE webhook.
-
-• Emits one INFO line per event + deep DEBUG when DEBUG=1.
+OPTIONAL
+────────
+COUNTRY_DIAL_CODE      default +CC when normalising (default “+44”)
+DEFAULT_CALLER_ID      CLI if Vapi omits one
+OUTBOUND_CLI           fixed, verified CLI to present on agent leg
+DEBUG=1                verbose logs (headers, payload dumps)
+RETRY_TO_TIXAE=1       retry dashboard forward once on failure
 """
 
 from __future__ import annotations
@@ -51,7 +38,7 @@ from urllib.error import HTTPError, URLError
 from dotenv import load_dotenv
 from pymongo import MongoClient
 
-# ── env & logging ────────────────────────────────────────────────────
+# ── environment & logging ────────────────────────────────────────────
 load_dotenv()
 
 DEBUG = os.getenv("DEBUG") == "1"
@@ -83,7 +70,7 @@ COLL = (
     [os.environ["DB_NAME"]][os.environ["COLLECTION_NAME"]]
 )
 
-# ── helpers ──────────────────────────────────────────────────────────
+# ── helper functions ────────────────────────────────────────────────
 
 
 def _json(code: int, payload: Dict[str, Any] | str) -> Tuple[int, list, bytes]:
@@ -93,7 +80,7 @@ def _json(code: int, payload: Dict[str, Any] | str) -> Tuple[int, list, bytes]:
 
 
 def _norm(num: str | None) -> str | None:
-    """Return E.164 version of num or None."""
+    """Normalise dial strings to E.164 or return None."""
     if not num:
         return None
     num = re.sub(r"[^\d+]", "", num)
@@ -107,7 +94,7 @@ def _norm(num: str | None) -> str | None:
 
 
 def _post_to_tixae(blob: bytes, hdrs: dict[str, str]) -> None:
-    """Fire-and-forget (with optional retry) to the legacy TIXAE webhook."""
+    """Forward any non-transfer event to the original Tixae webhook."""
     def _once() -> None:
         req = urllib.request.Request(
             TIXAE_URL,
@@ -135,26 +122,27 @@ def _post_to_tixae(blob: bytes, hdrs: dict[str, str]) -> None:
         except Exception as exc2:
             LOG.error("TIXAE retry failed: %s", exc2)
 
-# ── HTTP handler ─────────────────────────────────────────────────────
+# ── HTTP handler ────────────────────────────────────────────────────
 
 
 class handler(BaseHTTPRequestHandler):  # noqa: N801
-    def log_message(self, *_: Any) -> None:  # silence default access log
-        return
+    def log_message(self, *_: Any) -> None:
+        return  # silence default access log
 
     # -----------------------------------------------------------------
     def do_POST(self) -> None:  # noqa: N802
         raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+
         if DEBUG:
             LOG.debug("HDR %s", dict(self.headers) | {"bodyLen": len(raw)})
 
         # Shared-secret check
-        incoming_secret = (
+        secret = (
             self.headers.get("x-vapi-secret")
             or self.headers.get("x-vapi-signature")
             or self.headers.get("secret")
         )
-        if VAPI_SECRET and incoming_secret != VAPI_SECRET:
+        if VAPI_SECRET and secret != VAPI_SECRET:
             return self._send(*_json(401, {"error": "unauthenticated"}))
 
         # Decode JSON
@@ -168,11 +156,11 @@ class handler(BaseHTTPRequestHandler):  # noqa: N801
         etype = evt.get("type")
         LOG.info("★ %s", etype)
 
-        # 1️⃣ normal transfer-destination-request
+        # 1️⃣ genuine transfer request
         if etype == "transfer-destination-request":
             return self._send(*self._handle_transfer(evt))
 
-        # 2️⃣ LLM issued phone-call-control/forward with a 5/6-digit listing ID
+        # 2️⃣ rogue forward with 5/6-digit listing ID
         if etype == "phone-call-control" and evt.get("request") == "forward":
             num = evt.get("forwardingPhoneNumber", "")
             if re.fullmatch(r"\d{5,6}", num):
@@ -183,13 +171,13 @@ class handler(BaseHTTPRequestHandler):  # noqa: N801
                 }
                 return self._send(*self._handle_transfer(synthetic))
 
-        # 3️⃣ everything else → just forward; no destination!
+        # 3️⃣ all other events → forward only (NO destination!)
         _post_to_tixae(raw, dict(self.headers))
         return self._send(*_json(200, {"success": True}))
 
     # -----------------------------------------------------------------
     def _handle_transfer(self, evt: Dict[str, Any]) -> Tuple[int, list, bytes]:
-        """Return destination JSON in both current & legacy schema."""
+        """Return destination JSON (both new & legacy schema)."""
         args = (evt.get("artifact") or {}).get(
             "toolCall", {}).get("arguments", {})
         if isinstance(args, str):
@@ -200,7 +188,6 @@ class handler(BaseHTTPRequestHandler):  # noqa: N801
 
         listing_id = args.get("listing_id")
         if not listing_id:
-            LOG.warning("transfer with no listing_id")
             return _json(200, {"error": "missing listing_id"})
 
         # Mongo lookup
@@ -216,7 +203,6 @@ class handler(BaseHTTPRequestHandler):  # noqa: N801
             "phone_direct"), FALLBACK_NUM]
         number = next((n for n in (_norm(p) for p in phones) if n), None)
         if not number:
-            LOG.warning("listing %s has no valid phone", listing_id)
             return _json(200, {"error": "no valid phone"})
 
         if DEBUG:
@@ -233,8 +219,8 @@ class handler(BaseHTTPRequestHandler):  # noqa: N801
             "callerId": OUTBOUND_CLI or CLI_DEFAULT,
         }
         response = {
-            "destination": dest_core,  # new schema (May-2025)
-            "transferDestination": {   # legacy schema (pre-2025)
+            "destination": dest_core,        # schema as of May-2025
+            "transferDestination": {         # legacy schema (pre-2025)
                 "type": "phone-number",
                 "phoneNumber": number,
                 "callerId": dest_core["callerId"],
@@ -255,7 +241,7 @@ class handler(BaseHTTPRequestHandler):  # noqa: N801
         self.wfile.write(body)
 
 
-# ── local smoke test ─────────────────────────────────────────────────
+# ── local smoke-test ────────────────────────────────────────────────
 if __name__ == "__main__":
     LOG.info("★ proxy listening on http://0.0.0.0:8000 (DEBUG=%s)", DEBUG)
-    HTTPServer(("", 8000), handler).serve_forever()        
+    HTTPServer(("", 8000), handler).serve_forever()            

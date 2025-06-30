@@ -3,18 +3,22 @@
 Vapi → Property search proxy (Vercel deployment).
 
 Accepts POST tool-call envelopes from Vapi, runs the Mongo search, optionally
-fires WhatsApp, and returns results in:
+fires WhatsApp, and returns results as:
 
     {"results": [{"toolCallId": "…", "result": …}, …]}
 
-NEW 2025-06-01
-──────────────
-• Supports the `features` array (amenity keywords).
+2025-06-30  ✨  Changes
+────────────────────────────────────────────────────────────────────
+• Forwards the new `status` filter ("current" / "sold").
+• Uses repo.find_best() for ranked matching.
 """
 
 from __future__ import annotations
 
-# local imports
+# third-party
+from dotenv import load_dotenv
+
+# local imports (keep after dotenv so env vars are loaded)
 from property_search import (  # type: ignore
     Settings,
     PropertyRepository,
@@ -30,12 +34,6 @@ import sys
 import traceback
 from http.server import BaseHTTPRequestHandler
 from typing import Any, Dict, List
-
-# third-party
-from dotenv import load_dotenv
-
-# allow imports from lib/ dir if you have helpers there
-sys.path.append("lib")
 
 # ────────────────────────────────────────────────────────────────────
 CORS = {
@@ -57,7 +55,7 @@ def _json_response(code: int, payload) -> tuple[int, list[tuple[str, str]], byte
 class handler(BaseHTTPRequestHandler):  # pylint: disable=invalid-name
     """Vercel looks for a symbol literally called `handler`."""
 
-    # quiet default logging
+    # silence default logging
     def log_message(self, *_):  # noqa: D401
         return
 
@@ -124,10 +122,17 @@ class handler(BaseHTTPRequestHandler):  # pylint: disable=invalid-name
                 "keyword": loc,
                 "purpose": args.get("purpose", "all"),
             }
+
+            # numeric filters
             for fld in ("beds_min", "baths_min", "price_min", "price_max"):
                 if fld in args and args[fld] is not None:
                     q[fld] = args[fld]
 
+            # lifecycle filter (current / sold)
+            if args.get("status") in ("current", "sold"):
+                q["status"] = args["status"]
+
+            # sub-category (fuzzy)
             canon = normalise_subcategory(args.get("subcategory") or "")
             if canon:
                 q["subcategories"] = {"$regex": canon, "$options": "i"}
@@ -139,7 +144,7 @@ class handler(BaseHTTPRequestHandler):  # pylint: disable=invalid-name
 
             # search ----------------------------------------------------
             try:
-                doc, _tier = repo.find_one(q)
+                doc, _tier = repo.find_best(q)
                 if not doc:
                     results.append({"toolCallId": tc_id,
                                     "result": "no property found"})
