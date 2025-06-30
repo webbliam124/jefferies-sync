@@ -3,23 +3,15 @@
 """
 Rex → Mongo synchroniser for Jefferies London
 ─────────────────────────────────────────────
-• GET  /api/rex_sync — manual trigger (Vercel function)
-• Cron /api/rex_sync — scheduled via vercel.json
+• GET  /api/rex_sync  — manual trigger (Vercel function)
+• Cron /api/rex_sync  — scheduled via vercel.json
 
-Stores (per listing)
-• Core: id, purpose, status, price_display, beds, baths, size
-• Location: full address, lat/lon, postcode/locality tokens
-• Media: hero image URL + e-brochure link
-• Facets: tags, subcategories, features
-• People: agents[]
-• Marketing: advert_internet / brochure / stocklist
-• House-keeping: system_modtime_iso, updated_at
-
-2025-06-30  ✨  New
-• Handles April-2025 Rex API changes (attr_* keys, advert_* now optional)
-• Deletes Mongo docs no longer returned by Rex
-• Adds location_terms for richer search
-• Exposes a WSGI `handler` callable (required by Vercel ≥ 2024-12)
+2025-06-30
+• Purges withdrawn listings
+• Adds location_terms for search
+• Compatible with April-2025 Rex API
+• Exposes BOTH a BaseHTTPRequestHandler `handler` *and*
+  a WSGI `app` callable (either is accepted by Vercel)
 """
 
 from __future__ import annotations
@@ -37,6 +29,7 @@ from typing import Any, Dict, List, Tuple, Generator
 
 import httpx
 from dotenv import load_dotenv
+from http.server import BaseHTTPRequestHandler
 from pymongo import MongoClient, UpdateOne
 
 # ───── env & logging ──────────────────────────────────────────────
@@ -99,9 +92,8 @@ STATIC_EXTRAS: List[str] = [
     "tags",
     "features",
     "subcategories",
-    "images",                     # to derive hero image
+    "images",                     # hero image
     "listing_sale_or_rental",
-    # became optional April-2025
     "advert_internet",
     "advert_brochure",
     "advert_stocklist",
@@ -255,7 +247,7 @@ def _flatten(rec: dict) -> dict:
         "features": _list(rec.get("features")),
         # people
         "agents": agents,
-        # marketing blocks
+        # marketing
         "advert_internet": rec.get("advert_internet", {}),
         "advert_brochure": rec.get("advert_brochure", {}),
         "advert_stocklist": rec.get("advert_stocklist", {}),
@@ -433,22 +425,40 @@ async def sync() -> Dict[str, Any]:
 
     return run_doc
 
-# ───── WSGI entry-point for Vercel ────────────────────────────────
+# ───── HTTP handler (BaseHTTPRequestHandler) ──────────────────────
 
 
-def handler(environ, start_response) -> Generator[bytes, None, None]:
-    """
-    Minimal WSGI callable expected by Vercel’s Python runtime.
-    • Always returns JSON (success or error)
-    """
+class handler(BaseHTTPRequestHandler):                           # noqa: N801
+    """Entry-point expected by Vercel’s Python runtime."""
+
+    def log_message(self, *_):  # silence default logging
+        return
+
+    def do_GET(self):  # pylint: disable=invalid-name
+        try:
+            body = json.dumps(asyncio.run(sync()), default=str).encode()
+            status = 200
+        except Exception as exc:                                 # pylint: disable=broad-except
+            log.exception("sync failed")
+            body, status = json.dumps(
+                {"error": str(exc)}, default=str).encode(), 500
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+# ───── WSGI `app` fallback (also accepted by Vercel) ──────────────
+
+
+def app(environ, start_response) -> Generator[bytes, None, None]:  # noqa: D401
     try:
         body = json.dumps(asyncio.run(sync()), default=str).encode()
         status = b"200 OK"
-    except Exception as exc:  # pylint: disable=broad-except
+    except Exception as exc:                                       # pylint: disable=broad-except
         log.exception("sync failed")
         body = json.dumps({"error": str(exc)}, default=str).encode()
         status = b"500 Internal Server Error"
-
     headers = [(b"Content-Type", b"application/json"),
                (b"Content-Length", str(len(body)).encode())]
     start_response(status, headers)
