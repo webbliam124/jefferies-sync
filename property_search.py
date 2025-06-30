@@ -3,30 +3,17 @@
 property_search.py — Mongo search + WhatsApp notify
 ===================================================
 
-A command-line and library helper that:
+Looks up a best-match property in MongoDB with a four-tier fallback
+strategy, optionally sends an interactive WhatsApp e-brochure, and
+returns a compact JSON summary (includes agent data).
 
-1. Looks up a single best-match property in MongoDB with a **four-tier** fallback
-   strategy (full → no_price → no_beds_baths → location_only).
-2. Optionally WhatsApps an e-brochure using a template (if `--to` supplied and
-   `--dry` not set).
-3. Prints a compact JSON summary (now includes `agent` block).
-
-CHANGE-LOG
-──────────
-• 2025-06-01  ✨ *Amenity keyword* support  
-              – new JSON/CLI `features` list, fuzzy synonym resolver, extended
-                text search and regex tiers.
-
-• 2025-05-29  Added agent details to summary.
-
-• 2025-05-27  Fuzzy sub-category mapping (“penthouse”, “terraced house”…).
-
-• 2025-05-26  Introduced `--purpose {sale|rental|all}` flag.
+2025-06-30  ✨  New
+• Added find_best() wrapper (alias to find_one()) so newer callers work.
 """
 
 from __future__ import annotations
 
-# ── standard library ────────────────────────────────────────────────
+# ── standard library ──────────────────────────────────────────────
 import argparse
 import json
 import logging
@@ -37,7 +24,7 @@ from dataclasses import dataclass
 from difflib import get_close_matches
 from typing import Any, Dict, List, Optional, Tuple
 
-# ── third-party ─────────────────────────────────────────────────────
+# ── third-party ───────────────────────────────────────────────────
 import requests
 from dotenv import load_dotenv
 from pymongo import ASCENDING, MongoClient, TEXT
@@ -46,9 +33,9 @@ from pymongo.errors import ConnectionFailure, OperationFailure
 from requests.exceptions import HTTPError, RequestException
 from rich import print
 
-# ────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 # sub-category + feature synonym helpers
-# ────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 _SUBCAT_DICT = {
     "house": {
         "detached house", "semi-detached house", "terraced house",
@@ -68,7 +55,7 @@ _LOOKUP = {
     for synonym in synonyms
 }
 
-# Minimal amenity-keyword map.  Grow as the data warrants.
+# Minimal amenity-keyword map.  Extend as data warrants.
 _FEATURE_MAP = {
     "private garden":      {"garden", "roof garden", "roof terrace"},
     "stairs":              {"stairs", "internal staircase", "duplex"},
@@ -80,7 +67,6 @@ _FEATURE_MAP = {
 
 
 def _normalise_feature(term: str) -> str:
-    """Return canonical feature keyword if recognised, else the raw term."""
     t = term.casefold().strip()
     for canon, syns in _FEATURE_MAP.items():
         if t == canon or t in syns:
@@ -89,7 +75,6 @@ def _normalise_feature(term: str) -> str:
 
 
 def normalise_subcategory(user_value: str) -> Optional[str]:
-    """Map free-form subtype → {house|flat|other} or None."""
     if not user_value:
         return None
     val = user_value.casefold().strip()
@@ -99,9 +84,9 @@ def normalise_subcategory(user_value: str) -> Optional[str]:
     return _LOOKUP[hit[0]] if hit else None
 
 
-# ────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 # configuration
-# ────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 load_dotenv(override=True)
 
 EBROCHURE_BASE = (
@@ -139,9 +124,9 @@ class Settings:
         return f"https://graph.facebook.com/v19.0/{self.waba_phone_id}/messages"
 
 
-# ────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 # Mongo repository
-# ────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 class PropertyRepository:
     """Thin DAO with four-tier search strategy (feature-aware)."""
 
@@ -150,7 +135,7 @@ class PropertyRepository:
         self._col: Collection = self._client[cfg.db_name][cfg.collection_name]
         self._ensure_indexes()
 
-    # connectivity ----------------------------------------------------
+    # connectivity --------------------------------------------------
     def ping(self) -> bool:
         try:
             self._client.admin.command("ping")
@@ -158,7 +143,7 @@ class PropertyRepository:
         except ConnectionFailure:
             return False
 
-    # indexes ---------------------------------------------------------
+    # indexes -------------------------------------------------------
     def _ensure_indexes(self):
         self._col.create_index([("purpose", ASCENDING)])
         text_keys = [
@@ -169,6 +154,7 @@ class PropertyRepository:
             ("advert_internet.body", TEXT),
             ("highlights.description", TEXT),
             ("features", TEXT),
+            ("location_terms", TEXT),
         ]
         try:
             self._col.create_index(text_keys, name="text_search",
@@ -181,7 +167,7 @@ class PropertyRepository:
             else:
                 raise
 
-    # search ----------------------------------------------------------
+    # search --------------------------------------------------------
     def find_one(self, p: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], str]:
         key = (p.get("keyword") or "").strip()
         if not key:
@@ -195,8 +181,10 @@ class PropertyRepository:
             base["purpose"] = purpose
         if canon:
             base["subcategories"] = {"$regex": canon, "$options": "i"}
+        if p.get("status") in ("current", "sold"):
+            base["status"] = p["status"]
 
-        # amenity keywords -------------------------------------------
+        # amenity keywords -----------------------------------------
         raw_feats: List[str] = p.get("features") or []
         feats: List[str] = [_normalise_feature(t) for t in raw_feats]
 
@@ -260,16 +248,25 @@ class PropertyRepository:
                 return doc, name
         return None, "none"
 
+    # ------------------------------------------------------------------
+    def find_best(self, query: Dict[str, Any]):
+        """
+        Alias kept for backward compatibility – Vapi handler now calls
+        PropertyRepository.find_best(); internally we still use find_one()
+        as the canonical implementation.
+        """
+        return self.find_one(query)
 
-# ────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 # WhatsApp helper
-# ────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
+
+
 def _nz(v: Optional[str]) -> str:
     return v if v and str(v).strip() else "-"
 
 
 def send_whatsapp(cfg: Settings, phone: str, summary: Dict[str, Any]) -> None:
-    """Send template *send_property* with named params."""
     headers = {
         "Authorization": f"Bearer {cfg.waba_token}",
         "Content-Type": "application/json",
@@ -320,11 +317,11 @@ def send_whatsapp(cfg: Settings, phone: str, summary: Dict[str, Any]) -> None:
         raise
 
 
-# ────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 # misc helpers + summary builder (agent support)
-# ────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 def _strip_house_number(a: str) -> str:
-    return re.sub(r"^\\s*\\d+\\s*", "", a).strip()
+    return re.sub(r"^\s*\d+\s*", "", a).strip()
 
 
 def _pick_main_image(rec: Dict[str, Any]) -> str:
@@ -332,8 +329,6 @@ def _pick_main_image(rec: Dict[str, Any]) -> str:
 
 
 def summarise(rec: Dict[str, Any]) -> Dict[str, Any]:
-    """Return a compact dict suitable for both CLI JSON and VAPI."""
-
     am = rec.get("attributes") or rec.get("attributes_full", {})
     addr = rec.get("address", {})
     addr_fmt = addr.get("formats", {})
@@ -415,9 +410,9 @@ def summarise(rec: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-# ────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 # CLI helpers
-# ────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Property search CLI with WhatsApp auto-send")
@@ -448,9 +443,9 @@ def _query(ns: argparse.Namespace) -> Dict[str, Any]:
     return q
 
 
-# ────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 # main
-# ────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 def main() -> None:
     cfg = Settings.from_env()
     repo = PropertyRepository(cfg)
@@ -461,7 +456,7 @@ def main() -> None:
 
     ns = _parse_args()
     try:
-        doc, tier = repo.find_one(_query(ns))
+        doc, tier = repo.find_best(_query(ns))
     except ValueError as exc:
         logging.error("%s", exc)
         sys.exit(2)
