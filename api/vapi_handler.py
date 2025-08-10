@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-from dotenv import load_dotenv
 
-import json
-import logging
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Any, Dict, List
 import os
 import sys
-from lib.property_search import Settings, PropertyRepository, summarise, send_whatsapp
+import json
+import logging
+from http.server import BaseHTTPRequestHandler
+from typing import Any, Dict, List
+from dotenv import load_dotenv
+
+# make repo root importable so `lib/` can be found when running from /api
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
-
-# allow importing property_search from project root
-sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-from property_search import Settings, PropertyRepository, summarise, send_whatsapp  # noqa: E402
+from lib.property_search import Settings, PropertyRepository, summarise, send_whatsapp  # noqa: E402
 
 load_dotenv(override=True)
 
