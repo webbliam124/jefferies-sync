@@ -1,20 +1,12 @@
 {
-  "functions": {
-    "api/vapi_handler.py": {
-      "runtime": "python3.11"
-    },
-    "api/rex_sync.py": {
-      "runtime": "python3.11",
-      "maxDuration": 60
-    }
-  },
+  "version": 2,
   "routes": [
     {
-      "src": "/api/vapi_handler",
+      "src": "^/api/vapi_handler$",
       "dest": "api/vapi_handler.py"
     },
     {
-      "src": "/api/rex_sync",
+      "src": "^/api/rex_sync$",
       "dest": "api/rex_sync.py"
     }
   ],
