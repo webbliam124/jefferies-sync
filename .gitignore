@@ -1,10 +1,17 @@
-# Byte-code / virtual env
+# Python
 __pycache__/
-*.py[cod]
+*.pyc
+*.pyo
+*.pyd
+.env.*
 .venv/
-# OS cruft
-.DS_Store
-# Vercel local metadata
-.vercel/
+venv/
+
+# Vercel & local
 .vercel
 .env
+*.log
+/tmp/
+
+# Backups
+*.bak

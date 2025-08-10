@@ -1,19 +1,10 @@
 {
-  "version": 2,
+  "functions": {
+    "api/**/*.py": {
+      "maxDuration": 60
+    }
+  },
   "crons": [
-    {
-      "path": "/api/rex_sync",
-      "schedule": "0 3 * * *"
-    }
-  ],
-  "routes": [
-    {
-      "src": "/api/dynamic_transfer_handler",
-      "dest": "/api/dynamic_transfer_handler.py"
-    },
-    {
-      "src": "/api/vapi-event",
-      "dest": "/api/vapi_proxy.py"
-    }
+    { "path": "/api/rex_sync", "schedule": "0 */3 * * *" }
   ]
 }
