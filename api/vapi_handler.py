@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+from lib.property_search import Settings, PropertyRepository, summarise, send_whatsapp
 
 import os
 import sys
 import json
 import logging
 from http.server import BaseHTTPRequestHandler
-from typing import Any, Dict, List
+from typing import Any, Dict
 from dotenv import load_dotenv
 
-# make repo root importable so `lib/` can be found when running from /api
+# add repo root so we can import lib/
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-
-from lib.property_search import Settings, PropertyRepository, summarise, send_whatsapp  # noqa: E402
 
 load_dotenv(override=True)
 
