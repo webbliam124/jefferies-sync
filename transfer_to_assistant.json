@@ -1,0 +1,4 @@
+{
+  "type": "transfer-destination-request",
+  "artifact": { "toolCall": { "arguments": "{\"targetName\":\"Mortgage Assistant\"}" } }
+}

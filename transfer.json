@@ -1,9 +1,5 @@
 {
   "type": "transfer-destination-request",
   "phoneNumber": "+27831234567",
-  "artifact": {
-    "toolCall": {
-      "arguments": "{\"listing_id\":\"ABC123\"}"
-    }
-  }
+  "artifact": { "toolCall": { "arguments": "{\"listing_id\":\"ABC123\"}" } }
 }

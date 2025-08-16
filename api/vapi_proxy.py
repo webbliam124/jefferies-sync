@@ -1,247 +1,465 @@
 #!/usr/bin/env python3
-"""
-api/vapi_proxy.py — Vapi ➜ TIXAE proxy (final, June-2025)
-
-──────────────────────────────────────────────────────────────────────────────
-MUST-set env-vars
-──────────────────────────────────────────────────────────────────────────────
-VAPI_SECRET            shared secret from Vapi dashboard
-MONGODB_URI            Mongo connection string
-DB_NAME                database name
-COLLECTION_NAME        collection holding listing docs
-FALLBACK_NUMBER        duty negotiator’s E.164 mobile
-TIXAE_AGENT_ID         Tixae agent slug (e.g. y77c1kx9fboojeu5)
-
-OPTIONAL
-────────
-COUNTRY_DIAL_CODE      default +CC when normalising (default “+44”)
-DEFAULT_CALLER_ID      CLI if Vapi omits one
-OUTBOUND_CLI           fixed, verified CLI to present on agent leg
-DEBUG=1                verbose logs (headers, payload dumps)
-RETRY_TO_TIXAE=1       retry dashboard forward once on failure
-"""
+# api/vapi_proxy.py
+# Vapi ➜ (optional) dynamic resolver ➜ destination JSON
+# Works on Vercel (serverless) and locally (HTTPServer below)
 
 from __future__ import annotations
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
+import hashlib
+import hmac
 import json
 import logging
 import os
 import re
-import ssl
 import sys
 import time
+import ssl
 import urllib.request
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 from urllib.error import HTTPError, URLError
 
-from dotenv import load_dotenv
-from pymongo import MongoClient
-
-# ── environment & logging ────────────────────────────────────────────
-load_dotenv()
+# ──────────────────────────────────────────────────────────────────────────────
+# configuration & logging
+# ──────────────────────────────────────────────────────────────────────────────
 
 DEBUG = os.getenv("DEBUG") == "1"
-RETRY_TIXAE = os.getenv("RETRY_TO_TIXAE") == "1"
+
+
+def _ts() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + f".{int((time.time()%1)*1000):03d}Z"
+
 
 logging.basicConfig(
-    stream=sys.stderr,
+    stream=sys.stdout,
     level=logging.DEBUG if DEBUG else logging.INFO,
-    format="%(levelname)s %(message)s",
+    format="%(message)s",
 )
-LOG = logging.getLogger(__name__)
-if DEBUG:
-    logging.getLogger("pymongo").setLevel(logging.WARNING)
+LOG = logging.getLogger("vapi-proxy")
 
-# ── constants ────────────────────────────────────────────────────────
-VAPI_SECRET = os.getenv("VAPI_SECRET")
-FALLBACK_NUM = os.getenv("FALLBACK_NUMBER")
+
+def _log(level: str, msg: str, **kv: Any) -> None:
+    parts = [f"{_ts()} | {level.upper():5} | {msg}"]
+    if kv:
+        try:
+            parts.append(
+                "| " + " ".join(f"{k}={json.dumps(v, ensure_ascii=False)}" for k, v in kv.items()))
+        except Exception:
+            parts.append("| (kv-encode-failed)")
+    print(" ".join(parts), flush=True)
+
+
+# env
+VAPI_SECRET = os.getenv("VAPI_SECRET", "")
+DYN_ENABLED = os.getenv("DYNAMIC_TRANSFER_ENABLED") == "1"
+DYN_URL = os.getenv("DYNAMIC_TRANSFER_URL", "")
+DYN_SECRET = os.getenv("DYNAMIC_TRANSFER_SECRET", VAPI_SECRET)
+
+FORWARD_URL = os.getenv("FORWARD_URL", "")  # optional analytics sink
+FORWARD_RETRY = os.getenv("FORWARD_RETRY", "0") == "1"
+
 DIAL_CODE = os.getenv("COUNTRY_DIAL_CODE", "+44")
 CLI_DEFAULT = os.getenv("DEFAULT_CALLER_ID", "")
 OUTBOUND_CLI = os.getenv("OUTBOUND_CLI", CLI_DEFAULT)
 
-TIXAE_URL = (
-    "https://na-gcp-api.vg-stuff.com/v2/agents/"
-    f"{os.getenv('TIXAE_AGENT_ID')}/vapi-event"
-)
+DEFAULT_TRANSFER_MODE = (
+    os.getenv("DEFAULT_TRANSFER_MODE") or "warm").lower().strip()
 
-COLL = (
-    MongoClient(os.environ["MONGODB_URI"], tz_aware=True)
-    [os.environ["DB_NAME"]][os.environ["COLLECTION_NAME"]]
-)
-
-# ── helper functions ────────────────────────────────────────────────
+# directories (inline JSON)
 
 
-def _json(code: int, payload: Dict[str, Any] | str) -> Tuple[int, list, bytes]:
+def _env_json(name: str) -> dict:
+    raw = os.getenv(name, "") or ""
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        _log("warning", f"{name} JSON failed to parse", sample=raw[:120])
+        return {}
+
+
+CONTACTS = _env_json("CONTACTS_JSON")           # "Name" -> "+44..."
+ASSISTANTS = _env_json("ASSISTANTS_JSON")       # "alias" -> assistantId
+ALIASES = _env_json("ALIASES_JSON")             # "alias" -> "Canonical Name"
+# "Canonical Name" -> {mode, callerId}
+PREFERENCES = _env_json("PREFERENCES_JSON")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+_E164_RE = re.compile(r"^\+\d{6,18}$")
+
+
+def _norm_e164(num: Optional[str]) -> Optional[str]:
+    """Normalize to E.164. Returns None if impossible."""
+    if not num:
+        return None
+    # strip everything except digits and '+'
+    s = re.sub(r"[^\d+]", "", str(num))
+    if not s:
+        return None
+    if s.startswith("+"):
+        return s if _E164_RE.match(s) else None
+    # handle UK-style leading zero
+    if s.startswith("0"):
+        cand = DIAL_CODE + s.lstrip("0")
+        return cand if _E164_RE.match(cand) else None
+    # raw national w/o 0 – assume DIAL_CODE
+    cand = DIAL_CODE + s
+    return cand if _E164_RE.match(cand) else None
+
+
+def _safe_json(obj: Any) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        return "<unserializable>"
+
+
+def _hmac_ok(raw: bytes, signature: str, secret: str) -> bool:
+    if not signature or not secret:
+        return False
+    try:
+        mac = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(mac, signature.lower())
+    except Exception:
+        return False
+
+
+def _auth_ok(headers: dict, raw: bytes) -> Tuple[bool, str]:
+    """Allow either x-vapi-secret (plain) OR x-vapi-signature (HMAC SHA256)."""
+    plain = headers.get("x-vapi-secret") or headers.get("x-vapi-signature")
+    if VAPI_SECRET and plain == VAPI_SECRET:
+        _log("info", "auth: ok via x-vapi-secret (plain)")
+        return True, "plain"
+    sig = headers.get("x-vapi-signature", "")
+    if _hmac_ok(raw, sig, VAPI_SECRET):
+        _log("info", "auth: ok via x-vapi-signature (hmac)")
+        return True, "hmac"
+    return False, "none"
+
+
+def _post(url: str, blob: bytes, headers: dict, timeout: float = 10.0) -> Tuple[int, bytes, dict]:
+    req = urllib.request.Request(
+        url, data=blob, headers=headers, method="POST")
+    t0 = time.perf_counter()
+    try:
+        with urllib.request.urlopen(req, context=ssl.create_default_context(), timeout=timeout) as r:
+            body = r.read()
+            dt = int((time.perf_counter() - t0) * 1000)
+            _log("info", "http", url=url, status=r.status,
+                 ms=dt, out_len=len(body))
+            return r.status, body, dict(r.headers)
+    except HTTPError as e:
+        emsg = e.read().decode(errors="ignore")
+        dt = int((time.perf_counter() - t0) * 1000)
+        _log("warning", "http-error", url=url,
+             status=e.code, ms=dt, error=emsg[:400])
+        return e.code, emsg.encode(), {}
+    except URLError as e:
+        dt = int((time.perf_counter() - t0) * 1000)
+        _log("warning", "http-error", url=url, status=0, ms=dt, error=str(e))
+        return 0, b"", {}
+
+
+def _forward_elsewhere(raw: bytes, headers: dict) -> None:
+    if not FORWARD_URL:
+        return
+    # strip auth, pass a correlation id if present
+    hdrs = {"Content-Type": "application/json"}
+    if "x-call-id" in headers:
+        hdrs["x-call-id"] = headers["x-call-id"]
+    st, _, _ = _post(FORWARD_URL, raw, hdrs, timeout=6.0)
+    if st != 200 and FORWARD_RETRY:
+        _log("warning", "forward failed; retrying once", status=st)
+        _post(FORWARD_URL, raw, hdrs, timeout=6.0)
+
+
+def _build_transfer_plan(mode: str, summary: bool = True) -> dict:
+    mode = (mode or "warm").lower()
+    if mode.startswith("blind"):
+        return {"mode": "blind-transfer", "sipVerb": "refer"}
+    # default warm plan with summary
+    plan = {
+        "mode": "warm-transfer-experimental",
+        "summaryPlan": {
+            "enabled": bool(summary),
+            "messages": [
+                {"role": "system", "content": "Provide a concise summary of the call."},
+                {"role": "user", "content": "Here is the transcript:\n\n{{transcript}}\n\n"},
+            ],
+        },
+        "fallbackPlan": {
+            "message": "Could not complete the transfer. I’m still here.",
+            "endCallEnabled": False,
+        },
+    }
+    return plan
+
+
+def _choose_cli(canonical: str) -> str:
+    # per-contact override via PREFERENCES_JSON
+    pref = (PREFERENCES.get(canonical) or {})
+    return pref.get("callerId") or OUTBOUND_CLI or CLI_DEFAULT or ""
+
+
+def _choose_mode(canonical: str) -> str:
+    pref = (PREFERENCES.get(canonical) or {})
+    return (pref.get("mode") or DEFAULT_TRANSFER_MODE or "warm").lower()
+
+
+def _resolve_target(target_name: str) -> Tuple[Optional[dict], Optional[str]]:
+    """
+    Resolve a name into a destination dict. Returns (destination, errorMessage).
+    Handles assistants and humans; enforces E.164 for numbers.
+    """
+    if not target_name:
+        return None, "missing targetName"
+
+    raw = target_name.strip()
+    key = raw.casefold()
+
+    # alias normalisation
+    if ALIASES:
+        for alias, canonical in ALIASES.items():
+            if alias.casefold() == key:
+                raw = canonical
+                key = raw.casefold()
+                break
+
+    # assistants
+    for name, asst_id in ASSISTANTS.items():
+        if name.casefold() == key:
+            _log("info", "resolve_target → assistant", name=name, id=asst_id)
+            return {
+                "type": "assistant",
+                "assistantId": asst_id,
+                "message": f"Connecting you to {name}.",
+            }, None
+
+    # humans (contacts)
+    for name, phone in CONTACTS.items():
+        if name.casefold() == key:
+            number = _norm_e164(phone)
+            if not number:
+                return None, f"invalid phone for {name}"
+            mode = _choose_mode(name)
+            caller_id = _choose_cli(name)
+            _log(
+                "info",
+                "resolve_target → number",
+                name=name, number=number, mode=mode, cli=caller_id
+            )
+            dest = {
+                "type": "number",
+                "number": number,
+                "callerId": caller_id or None,
+                "message": f"Transferring you to {name}. Please hold.",
+                "transferPlan": _build_transfer_plan(mode, summary=True),
+            }
+            return dest, None
+
+    return None, "no_match"
+
+
+def _extract_args(evt: dict) -> dict:
+    """
+    Pulls parameters from either:
+      - message.functionCall.parameters (new shape)
+      - artifact.toolCall.arguments (stringified JSON, legacy)
+      - phone-call-control.forwardingPhoneNumber (name fallthrough)
+    """
+    # new shape
+    params = (evt.get("functionCall") or {}).get("parameters")
+    if isinstance(params, dict):
+        return params
+
+    # legacy artifact
+    args = (((evt.get("artifact") or {}).get("toolCall") or {}).get("arguments"))
+    if isinstance(args, str):
+        try:
+            return json.loads(args)
+        except Exception:
+            pass
+    elif isinstance(args, dict):
+        return args
+
+    # phone-control forward using a name
+    if evt.get("type") == "phone-call-control" and evt.get("request") == "forward":
+        fwd = evt.get("forwardingPhoneNumber")
+        if fwd and re.search(r"[A-Za-z]", str(fwd)):  # looks like a name, not digits
+            return {"targetName": str(fwd)}
+
+    return {}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# HTTP handler (works on Vercel as “handler” class)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _json_resp(code: int, payload: Dict[str, Any] | str) -> Tuple[int, list, bytes]:
     body = payload.encode() if isinstance(
         payload, str) else json.dumps(payload).encode()
     return code, [("Content-Type", "application/json")], body
 
 
-def _norm(num: str | None) -> str | None:
-    """Normalise dial strings to E.164 or return None."""
-    if not num:
-        return None
-    num = re.sub(r"[^\d+]", "", num)
-    if num.startswith("+"):
-        return num
-    if num.startswith("0"):
-        return DIAL_CODE + num.lstrip("0")
-    if len(num) > 10:
-        return "+" + num
-    return None
-
-
-def _post_to_tixae(blob: bytes, hdrs: dict[str, str]) -> None:
-    """Forward any non-transfer event to the original Tixae webhook."""
-    def _once() -> None:
-        req = urllib.request.Request(
-            TIXAE_URL,
-            data=blob,
-            headers={
-                "Content-Type": "application/json",
-                "x-request-id": hdrs.get("x-call-id", ""),
-            },
-            method="POST",
-        )
-        start = time.perf_counter()
-        with urllib.request.urlopen(req, context=ssl.create_default_context(), timeout=8) as r:
-            LOG.info("→ TIXAE %s (%.0f ms)", r.status,
-                     (time.perf_counter() - start) * 1000)
-
-    try:
-        _once()
-    except (HTTPError, URLError, ssl.SSLError) as exc:
-        if not RETRY_TIXAE:
-            LOG.warning("TIXAE forward failed: %s", exc)
-            return
-        LOG.warning("TIXAE error (%s) – retrying once …", exc)
-        try:
-            _once()
-        except Exception as exc2:
-            LOG.error("TIXAE retry failed: %s", exc2)
-
-# ── HTTP handler ────────────────────────────────────────────────────
-
-
 class handler(BaseHTTPRequestHandler):  # noqa: N801
     def log_message(self, *_: Any) -> None:
-        return  # silence default access log
+        return  # silence BaseHTTPRequestHandler's default access log
 
-    # -----------------------------------------------------------------
+    # core
     def do_POST(self) -> None:  # noqa: N802
         raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        hdrs = {k.lower(): v for k, v in self.headers.items()}
+        body_len = len(raw)
+        _log("info", "request", path=self.path, body_len=body_len)
 
-        if DEBUG:
-            LOG.debug("HDR %s", dict(self.headers) | {"bodyLen": len(raw)})
+        # auth
+        ok, how = _auth_ok(hdrs, raw)
+        if not ok:
+            self._send(*_json_resp(401, {"error": "unauthenticated"}))
+            return
 
-        # Shared-secret check
-        secret = (
-            self.headers.get("x-vapi-secret")
-            or self.headers.get("x-vapi-signature")
-            or self.headers.get("secret")
-        )
-        if VAPI_SECRET and secret != VAPI_SECRET:
-            return self._send(*_json(401, {"error": "unauthenticated"}))
-
-        # Decode JSON
+        # parse body
         try:
-            data = json.loads(raw or "{}")
-        except json.JSONDecodeError:
-            return self._send(*_json(400, {"error": "invalid JSON"}))
+            data = json.loads(raw or b"{}")
+        except Exception:
+            self._send(*_json_resp(400, {"error": "invalid JSON"}))
+            return
 
-        evt = data["message"] if isinstance(
+        # events can be naked or nested under "message"
+        evt = data.get("message") if isinstance(
             data.get("message"), dict) else data
         etype = evt.get("type")
-        LOG.info("★ %s", etype)
+        _log("info", "event.type="+str(etype or ""))
 
-        # 1️⃣ genuine transfer request
+        # healthcheck for sanity testing
+        if etype == "healthcheck":
+            self._send(*_json_resp(200, {"ok": True}))
+            return
+
+        # main: TRANSFER DESTINATION REQUEST
         if etype == "transfer-destination-request":
-            return self._send(*self._handle_transfer(evt))
+            # try dynamic resolver first (if enabled)
+            if DYN_ENABLED and DYN_URL:
+                # forward entire event; resolver knows how to read it
+                blob = json.dumps(evt).encode()
+                hdr = {"Content-Type": "application/json",
+                       "x-vapi-secret": DYN_SECRET or ""}
+                _log("info", "resolver.call",
+                     url=DYN_URL, secret=("set" if DYN_SECRET else "missing"),
+                     len=len(blob))
+                st, out, _ = _post(DYN_URL, blob, hdr, timeout=12.0)
+                if st == 200:
+                    try:
+                        j = json.loads(out or b"{}")
+                    except Exception:
+                        j = {}
+                    if isinstance(j, dict) and j.get("destination"):
+                        # log & return (also include legacy shim)
+                        resp = _with_legacy(j)
+                        _log("info", "OUT", destination=resp.get("destination"))
+                        self._send(*_json_resp(200, resp))
+                        return
+                    else:
+                        _log("warning", "resolver: 200 but no destination in body")
+                else:
+                    _log("warning", "resolver: non-200", status=st)
 
-        # 2️⃣ rogue forward with 5/6-digit listing ID
+            # fallback: resolve locally from tool parameters
+            args = _extract_args(evt)
+            target = (args.get("targetName") or "").strip()
+            lang = (args.get("language") or "").strip().lower()
+
+            # language-only hint → route to assistant if configured
+            if not target and lang:
+                if lang in ("mt", "maltese"):
+                    target = "jessemulti"
+                elif lang in ("el", "ell", "greek"):
+                    target = "jessegreek"
+
+            if not target:
+                _log("warning", "no targetName in request")
+                self._send(
+                    *_json_resp(200, {"error": "no_match", "hint": "supply targetName"}))
+                return
+
+            dest, err = _resolve_target(target)
+            if not dest:
+                self._send(*_json_resp(200, {"error": err or "no_match"}))
+                return
+
+            resp = _with_legacy({"destination": dest})
+            _log("info", "OUT", destination=resp.get("destination"))
+            self._send(*_json_resp(200, resp))
+            return
+
+        # optional: intercept a rogue forward with a *name* and answer with a destination
         if etype == "phone-call-control" and evt.get("request") == "forward":
-            num = evt.get("forwardingPhoneNumber", "")
-            if re.fullmatch(r"\d{5,6}", num):
-                synthetic = {
-                    "type": "transfer-destination-request",
-                    "phoneNumber": evt.get("callerId", ""),
-                    "artifact": {"toolCall": {"arguments": json.dumps({"listing_id": num})}},
-                }
-                return self._send(*self._handle_transfer(synthetic))
+            req = evt.get("forwardingPhoneNumber", "")
+            _log("info", "phone-control.forward", request=_safe_json(req))
+            # If it's a *name* not a number, try to resolve and answer with a destination anyway
+            if req and re.search(r"[A-Za-z]", str(req)):
+                dest, err = _resolve_target(str(req))
+                if dest:
+                    resp = _with_legacy({"destination": dest})
+                    _log("info", "OUT (from phone-control)",
+                         destination=resp.get("destination"))
+                    self._send(*_json_resp(200, resp))
+                    return
+                else:
+                    _log("warning", "forward name not found", name=req, error=err)
 
-        # 3️⃣ all other events → forward only (NO destination!)
-        _post_to_tixae(raw, dict(self.headers))
-        return self._send(*_json(200, {"success": True}))
+        # everything else: forward (optional) and ack
+        if FORWARD_URL:
+            _forward_elsewhere(raw, hdrs)
+        self._send(*_json_resp(200, {"success": True}))
 
-    # -----------------------------------------------------------------
-    def _handle_transfer(self, evt: Dict[str, Any]) -> Tuple[int, list, bytes]:
-        """Return destination JSON (both new & legacy schema)."""
-        args = (evt.get("artifact") or {}).get(
-            "toolCall", {}).get("arguments", {})
-        if isinstance(args, str):
-            try:
-                args = json.loads(args)
-            except json.JSONDecodeError:
-                args = {}
-
-        listing_id = args.get("listing_id")
-        if not listing_id:
-            return _json(200, {"error": "missing listing_id"})
-
-        # Mongo lookup
-        try:
-            rec = COLL.find_one({"_id": listing_id}) or COLL.find_one(
-                {"id": listing_id})
-        except Exception as exc:
-            LOG.error("Mongo error: %s", exc)
-            return _json(200, {"error": f"DB error: {exc}"})
-
-        agent = (rec.get("agents") or [{}])[0] if rec else {}
-        phones = [agent.get("phone_mobile"), agent.get(
-            "phone_direct"), FALLBACK_NUM]
-        number = next((n for n in (_norm(p) for p in phones) if n), None)
-        if not number:
-            return _json(200, {"error": "no valid phone"})
-
-        if DEBUG:
-            LOG.debug(
-                "listing %s → %s (%s)",
-                listing_id,
-                number,
-                "fallback" if number == FALLBACK_NUM else "agent",
-            )
-
-        dest_core = {
-            "type": "number",
-            "number": number,
-            "callerId": OUTBOUND_CLI or CLI_DEFAULT,
-        }
-        response = {
-            "destination": dest_core,        # schema as of May-2025
-            "transferDestination": {         # legacy schema (pre-2025)
-                "type": "phone-number",
-                "phoneNumber": number,
-                "callerId": dest_core["callerId"],
-            },
-        }
-
-        if DEBUG:
-            LOG.debug("→ returning %s", json.dumps(response, indent=2))
-
-        return _json(200, response)
-
-    # -----------------------------------------------------------------
     def _send(self, code: int, hdrs: list, body: bytes) -> None:
-        self.send_response(code)
-        for k, v in hdrs:
-            self.send_header(k, v)
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            for k, v in hdrs:
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(body)
+        except BrokenPipeError:
+            pass
+
+# add legacy shim for old SDKs that read transferDestination
 
 
-# ── local smoke-test ────────────────────────────────────────────────
+def _with_legacy(body: dict) -> dict:
+    body = dict(body or {})
+    dest = body.get("destination") or {}
+    legacy = {}
+    if dest.get("type") == "number":
+        legacy = {
+            "type": "phone-number",
+            "phoneNumber": dest.get("number"),
+            "assistantId": None,
+            "callerId": dest.get("callerId") or None,
+        }
+    elif dest.get("type") == "assistant":
+        legacy = {
+            "type": "assistant",
+            "assistantId": dest.get("assistantId"),
+            "phoneNumber": None,
+            "callerId": None,
+        }
+    if legacy:
+        body["transferDestination"] = legacy
+    return body
+
+# ──────────────────────────────────────────────────────────────────────────────
+# local dev entrypoint
+# ──────────────────────────────────────────────────────────────────────────────
+
+
 if __name__ == "__main__":
-    LOG.info("★ proxy listening on http://0.0.0.0:8000 (DEBUG=%s)", DEBUG)
-    HTTPServer(("", 8000), handler).serve_forever()            
+    port = int(os.getenv("PORT") or "8000")
+    _log("info", f"★ vapi_proxy listening on http://0.0.0.0:{port}",
+         dyn_enabled=DYN_ENABLED, dyn_url=bool(DYN_URL),
+         have_contacts=bool(CONTACTS), have_assts=bool(ASSISTANTS))
+    HTTPServer(("", port), handler).serve_forever()

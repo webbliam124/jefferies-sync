@@ -11,10 +11,6 @@
     {
       "src": "/api/transfer_webhook_min",
       "dest": "api/transfer_webhook_min.py"
-    },
-    {
-      "src": "/api/vapi_proxy",
-      "dest": "api/vapi_proxy.py"
     }
   ],
   "crons": [
