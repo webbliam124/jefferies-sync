@@ -115,7 +115,7 @@ class handler(BaseHTTPRequestHandler):  # noqa: N801
                 out["tier"] = tier
 
                 phone = args.get("phone_number")
-                dry = bool(args.get("dry", True))
+                dry = bool(args.get("dry", False))
                 if phone and not dry:
                     try:
                         send_whatsapp(cfg, phone, out)
